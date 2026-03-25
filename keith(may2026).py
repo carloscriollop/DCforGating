@@ -12,7 +12,7 @@
 #   - Plot y CSV ordenados por VGS ascendente (negativo -> positivo).
 #   - Ocultamos el 0 V SOLO en el trazo Down al graficar para evitar la “aguja”.
 # Reqs: pyvisa, matplotlib, numpy, tkinter
-#El cabrera
+
 
 
 import os, csv, time, threading, tkinter as tk
