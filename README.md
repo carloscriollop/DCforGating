@@ -1,2 +1,29 @@
 # DCforGating
-Python codes for DC characterization using Keithley SMU
+
+Python GUI for DC characterization of gated thin films with a Keithley 2636B
+(TSP mode): transfer curves, hysteresis loops, time traces and a contact
+check of gate, drain and source.
+
+- `keithley_gating_gui.py`: the program. Channel A (smua) drives the gate,
+  channel B (smub) holds VDS on the drain, source to LO.
+- `CHANGELOG.md`: design notes and revision history.
+
+## Setup
+
+```
+pip install -r requirements.txt
+python keithley_gating_gui.py
+```
+
+Needs a VISA backend (NI-VISA or Keysight IO Libraries) and the 2636B set to
+TSP command mode. Python's standard installer for Windows already includes
+tkinter.
+
+## Updating
+
+```
+git pull
+```
+
+Measurement CSVs, PNGs and contact-check reports are ignored by git; keep
+them in your data folder, not in this repository.
