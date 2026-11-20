@@ -789,7 +789,7 @@ class App(tk.Tk):
                 row=row, column=col + 1, sticky="w", padx=(6, 14), pady=pady)
 
         # Connection
-        conn = section(left, "Connection (TSP-only)")
+        conn = section(left, "1. Connection (TSP-only)")
         self.var_resource = tk.StringVar()
         self.cmb_resource = ttk.Combobox(conn, textvariable=self.var_resource, width=42)
         self.cmb_resource.grid(row=0, column=0, columnspan=3, sticky="we", padx=(0, 6))
@@ -802,7 +802,7 @@ class App(tk.Tk):
             conn.grid_columnconfigure(c, weight=1)
 
         # Sample and data folder
-        sav = section(left, "1. Sample and data folder")
+        sav = section(left, "2. Sample and data folder")
         self.var_sample = tk.StringVar(value=str(self.settings.get("sample", "sample")))
         self.var_folder = tk.StringVar(value=str(self.settings.get("folder", default_data_dir())))
         self.var_autosave = tk.BooleanVar(value=bool(self.settings.get("autosave", True)))
@@ -824,7 +824,7 @@ class App(tk.Tk):
         sav.grid_columnconfigure(1, weight=1)
 
         # Measurement: one tab per kind of measurement
-        msec = section(left, "2. Measurement (pick a tab, then Start above)")
+        msec = section(left, "3. Measurement (pick a tab, then Start above)")
         self.nb = ttk.Notebook(msec)
         self.nb.pack(fill=tk.X)
 
@@ -958,7 +958,7 @@ class App(tk.Tk):
             act.grid_columnconfigure(c, weight=1)
 
         # Instrument settings shared by every measurement
-        meas = section(left, "3. Instrument settings (all measurements)")
+        meas = section(left, "4. Instrument settings (all measurements)")
         self.var_compA = tk.StringVar(value="1e-6")
         self.var_compB = tk.StringVar(value="1e-3")
         self.var_nplc = tk.StringVar(value="1.0")
@@ -985,7 +985,7 @@ class App(tk.Tk):
             meas.grid_columnconfigure(c, weight=1)
 
         # Plot options
-        scale = section(left, "4. Plot options")
+        scale = section(left, "5. Plot options")
         ttk.Checkbutton(scale, text="Log |ID| (top)", variable=self.var_log_id,
                         command=self.apply_scales).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(scale, text="Log |IG| (bottom)", variable=self.var_log_ig,
