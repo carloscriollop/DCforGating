@@ -35,10 +35,9 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Written into every CSV and contact-check report, so each file says which
 # version of this program produced it.
-APP_VERSION = "2026-11-19.2"
+APP_VERSION = "2026-11-19.3"
 APP_TITLE = f"2636B TSP - ID/IG vs VGS or VDS (A = gate, B = drain)   v{APP_VERSION}"
 APP_SIZE = "1280x860"
-LEFT_PANEL_W = 500
 UI_POLL_MS = 50
 
 PALETTE = {
@@ -746,36 +745,48 @@ class App(tk.Tk):
         card.config(highlightbackground=PALETTE["border"])
         card.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=16, pady=8)
 
-        leftcol = tk.Frame(card, bg=PALETTE["panel"])
-        leftcol.pack(side=tk.LEFT, fill=tk.Y, padx=(16, 0), pady=16)
+        # Controls on the left, plot on the right, with a divider between them
+        # that can be dragged. The left side starts as wide as its contents
+        # need with this PC's fonts (see _fit_left_panel), so labels are never
+        # clipped; extra window width goes to the plot.
+        self.paned = tk.PanedWindow(card, orient=tk.HORIZONTAL, sashwidth=8, bd=0,
+                                    sashrelief=tk.FLAT, bg=PALETTE["border"])
+        self.paned.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
+        leftcol = tk.Frame(self.paned, bg=PALETTE["panel"])
+        right = tk.Frame(self.paned, bg=PALETTE["panel"])
+        self.paned.add(leftcol, minsize=340, stretch="never")
+        self.paned.add(right, minsize=360, stretch="always")
+
         # Fixed bar above the scrolling panel, so Start and Stop are always in view.
-        actbar = tk.Frame(leftcol, bg=PALETTE["panel"], highlightthickness=1,
-                          width=LEFT_PANEL_W + 18)
+        actbar = tk.Frame(leftcol, bg=PALETTE["panel"], highlightthickness=1)
         actbar.config(highlightbackground=PALETTE["border"])
-        actbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        actbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6), padx=(0, 8))
         holder = tk.Frame(leftcol, bg=PALETTE["panel"])
-        holder.pack(side=tk.TOP, fill=tk.Y, expand=True)
+        holder.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
         self.left_canvas = tk.Canvas(holder, bg=PALETTE["panel"], highlightthickness=0,
-                                     width=LEFT_PANEL_W, borderwidth=0)
+                                     borderwidth=0)
         left_sb = ttk.Scrollbar(holder, orient="vertical", command=self.left_canvas.yview)
         self.left_canvas.configure(yscrollcommand=left_sb.set)
         left_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.left_canvas.pack(side=tk.LEFT, fill=tk.Y, expand=False)
+        self.left_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         left = tk.Frame(self.left_canvas, bg=PALETTE["panel"])
-        self.left_canvas.create_window((0, 0), window=left, anchor="nw", width=LEFT_PANEL_W)
+        self.left_inner = left
+        left_win = self.left_canvas.create_window((0, 0), window=left, anchor="nw")
         left.bind("<Configure>",
                   lambda e: self.left_canvas.configure(scrollregion=self.left_canvas.bbox("all")))
-
-        sep = tk.Frame(card, width=1, bg=PALETTE["border"])
-        sep.pack(side=tk.LEFT, fill=tk.Y, padx=(12, 0), pady=16)
-        right = tk.Frame(card, bg=PALETTE["panel"])
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(12, 16), pady=16)
+        # The panel follows the canvas width, so dragging the divider re-flows it.
+        self.left_canvas.bind("<Configure>",
+                              lambda e: self.left_canvas.itemconfigure(left_win, width=e.width))
+        # Mouse wheel scrolls the panel while the pointer is over it.
+        self.left_canvas.bind("<Enter>", lambda e: self.left_canvas.bind_all(
+            "<MouseWheel>", self._on_left_wheel))
+        self.left_canvas.bind("<Leave>", lambda e: self.left_canvas.unbind_all("<MouseWheel>"))
 
         def section(parent, title):
             box = tk.Frame(parent, bg=PALETTE["panel"], highlightthickness=1)
             box.config(highlightbackground=PALETTE["border"])
-            box.pack(fill=tk.X, pady=6)
+            box.pack(fill=tk.X, pady=6, padx=(0, 4))
             head = tk.Frame(box, bg=PALETTE["panel"])
             head.pack(fill=tk.X, padx=10, pady=(8, 2))
             ttk.Label(head, text=title).pack(side=tk.LEFT)
@@ -783,23 +794,40 @@ class App(tk.Tk):
             body.pack(fill=tk.X, padx=10, pady=(2, 10))
             return body
 
+        def pairs(frame, n=2):
+            """Columns for n label/entry pairs: labels keep their width, entries stretch."""
+            for k in range(n):
+                frame.grid_columnconfigure(2 * k, weight=0)
+                frame.grid_columnconfigure(2 * k + 1, weight=1)
+
         def entry(parent, label, var, row, col, pady=(0, 0)):
             ttk.Label(parent, text=label).grid(row=row, column=col, sticky="w", pady=pady)
-            ttk.Entry(parent, textvariable=var, width=10).grid(
-                row=row, column=col + 1, sticky="w", padx=(6, 14), pady=pady)
+            ttk.Entry(parent, textvariable=var, width=8).grid(
+                row=row, column=col + 1, sticky="we", padx=(6, 12), pady=pady)
+
+        def wrapping(label):
+            """Hint text re-wraps to whatever width the panel has."""
+            label.bind("<Configure>",
+                       lambda e: e.widget.configure(wraplength=max(120, e.width - 4)))
+            return label
+
+        def hint(parent, text, row, span=4, pady=(6, 0)):
+            lbl = wrapping(ttk.Label(parent, text=text, style="Hint.TLabel",
+                                     wraplength=320, justify="left"))
+            lbl.grid(row=row, column=0, columnspan=span, sticky="we", pady=pady)
+            return lbl
 
         # Connection
         conn = section(left, "1. Connection (TSP-only)")
         self.var_resource = tk.StringVar()
-        self.cmb_resource = ttk.Combobox(conn, textvariable=self.var_resource, width=42)
-        self.cmb_resource.grid(row=0, column=0, columnspan=3, sticky="we", padx=(0, 6))
-        ttk.Button(conn, text="Detect", command=self.on_detect).grid(row=0, column=3, sticky="e")
+        self.cmb_resource = ttk.Combobox(conn, textvariable=self.var_resource, width=18)
+        self.cmb_resource.grid(row=0, column=0, sticky="we", padx=(0, 6))
+        ttk.Button(conn, text="Detect", command=self.on_detect).grid(row=0, column=1, sticky="e")
         ttk.Button(conn, text="Connect", style="Primary.TButton",
-                   command=self.on_connect).grid(row=0, column=4, sticky="e")
+                   command=self.on_connect).grid(row=0, column=2, sticky="e", padx=(6, 0))
         self.lbl_mode = ttk.Label(conn, text="Expecting TSP (native 2600).", style="Hint.TLabel")
-        self.lbl_mode.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
-        for c in range(5):
-            conn.grid_columnconfigure(c, weight=1)
+        self.lbl_mode.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        conn.grid_columnconfigure(0, weight=1)
 
         # Sample and data folder
         sav = section(left, "2. Sample and data folder")
@@ -807,20 +835,18 @@ class App(tk.Tk):
         self.var_folder = tk.StringVar(value=str(self.settings.get("folder", default_data_dir())))
         self.var_autosave = tk.BooleanVar(value=bool(self.settings.get("autosave", True)))
         ttk.Label(sav, text="Sample name").grid(row=0, column=0, sticky="w")
-        ttk.Entry(sav, textvariable=self.var_sample, width=24).grid(
-            row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Entry(sav, textvariable=self.var_sample, width=16).grid(
+            row=0, column=1, columnspan=2, sticky="we", padx=(6, 0))
         ttk.Label(sav, text="Data folder").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(sav, textvariable=self.var_folder, width=40).grid(
+        ttk.Entry(sav, textvariable=self.var_folder, width=16).grid(
             row=1, column=1, sticky="we", padx=(6, 6), pady=(6, 0))
         ttk.Button(sav, text="Browse", command=self.on_browse_folder).grid(
             row=1, column=2, sticky="e", pady=(6, 0))
-        ttk.Checkbutton(sav, text="Auto-save CSV, PNG and summary at the end of each run",
+        ttk.Checkbutton(sav, text="Auto-save CSV, PNG and summary after each run",
                         variable=self.var_autosave).grid(
             row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(sav, text="Files are named sample_measurement_date_time, so nothing is "
-                            "overwritten.",
-                  style="Hint.TLabel", wraplength=440, justify="left").grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        hint(sav, "Files are named sample_measurement_date_time, so nothing is overwritten.",
+             3, span=3, pady=(4, 0))
         sav.grid_columnconfigure(1, weight=1)
 
         # Measurement: one tab per kind of measurement
@@ -833,14 +859,8 @@ class App(tk.Tk):
             self.nb.add(outer, text=title)
             inner = tk.Frame(outer, bg=PALETTE["panel"])
             inner.pack(fill=tk.X, padx=8, pady=8)
-            for c in range(6):
-                inner.grid_columnconfigure(c, weight=1)
+            pairs(inner)
             return inner
-
-        def hint(parent, text, row, span=6):
-            ttk.Label(parent, text=text, style="Hint.TLabel", wraplength=430,
-                      justify="left").grid(row=row, column=0, columnspan=span,
-                                           sticky="w", pady=(6, 0))
 
         # Shared by the Transfer and Time trace tabs (one variable, two boxes).
         self.var_vds = tk.StringVar(value="0.05")
@@ -859,25 +879,24 @@ class App(tk.Tk):
 
         entry(prm, "VGS start (V)", self.var_start, 0, 0)
         entry(prm, "VGS stop (V)", self.var_stop, 0, 2)
-        entry(prm, "VGS step (V)", self.var_step, 0, 4)
-        entry(prm, "VDS (V)", self.var_vds, 1, 0, pady=(6, 0))
-        entry(prm, "Settle after ramp (s)", self.var_ramp_wait, 1, 2, pady=(6, 0))
+        entry(prm, "VGS step (V)", self.var_step, 1, 0, pady=(6, 0))
+        entry(prm, "VDS (V)", self.var_vds, 1, 2, pady=(6, 0))
+        entry(prm, "Settle after ramp (s)", self.var_ramp_wait, 2, 0, pady=(6, 0))
 
-        ttk.Label(prm, text="Mode").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(prm, text="Mode").grid(row=3, column=0, sticky="w", pady=(8, 0))
         for i, m in enumerate((MODE_ZERO_SAFE, MODE_HYSTERESIS, MODE_SINGLE)):
             ttk.Radiobutton(prm, text=m, value=m, variable=self.var_sweep_mode,
                             command=self._on_mode_change).grid(
-                row=3 + i // 2, column=(i % 2) * 3, columnspan=3, sticky="w", pady=(2, 0))
+                row=4 + i // 2, column=(i % 2) * 2, columnspan=2, sticky="w", pady=(2, 0))
 
-        ttk.Checkbutton(prm, text="Interleave sweep order (for slope fits, not for curve shape)",
+        ttk.Checkbutton(prm, text="Interleave order (for slope fits, not curve shape)",
                         variable=self.var_interleave,
                         command=self._on_mode_change).grid(
-            row=5, column=0, columnspan=6, sticky="w", pady=(8, 0))
+            row=6, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-        self.lbl_mode_hint = ttk.Label(prm, text="", style="Hint.TLabel", wraplength=430, justify="left")
-        self.lbl_mode_hint.grid(row=6, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        self.lbl_mode_hint = hint(prm, "", 7)
         hint(prm, "Settling check: run the same sweep at 0.2 s and at 1.0 s per point. If the "
-                  "curves differ, you are measuring transients, not steady state.", 7)
+                  "curves differ, you are measuring transients, not steady state.", 8)
 
         # Tab: output curves
         out = tab("Output curves")
@@ -889,8 +908,8 @@ class App(tk.Tk):
         # curve taken while ID creeps mixes drift into the slope.
         self.var_out_settle = tk.StringVar(value="60")
         ttk.Label(out, text="VGS values (V)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(out, textvariable=self.var_out_vgs, width=30).grid(
-            row=0, column=1, columnspan=5, sticky="we", padx=(6, 0))
+        ttk.Entry(out, textvariable=self.var_out_vgs, width=16).grid(
+            row=0, column=1, columnspan=3, sticky="we", padx=(6, 0))
         entry(out, "VDS max +/- (V)", self.var_out_vmax, 1, 0, pady=(6, 0))
         entry(out, "VDS step (V)", self.var_out_step, 1, 2, pady=(6, 0))
         entry(out, "Settle per VGS (s)", self.var_out_settle, 2, 0, pady=(6, 0))
@@ -940,22 +959,25 @@ class App(tk.Tk):
         ]
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
 
-        # Fill the fixed action bar (built above, before the scrolling panel)
+        # Fill the fixed action bar (built above, before the scrolling panel).
+        # Two rows of two, so the bar is never wider than the panel below it.
         act = tk.Frame(actbar, bg=PALETTE["panel"])
         act.pack(fill=tk.X, padx=10, pady=8)
         self.btn_start = ttk.Button(act, text=self._tab_runs[0][0], style="Primary.TButton",
                                     command=self.on_run_selected)
         self.btn_start.grid(row=0, column=0, sticky="we")
-        ttk.Button(act, text="Stop", command=self.on_stop).grid(row=0, column=1, sticky="we", padx=(6, 0))
-        ttk.Button(act, text="Save now", command=self.on_save_now).grid(row=0, column=2, sticky="we", padx=(6, 0))
+        ttk.Button(act, text="Stop", command=self.on_stop).grid(
+            row=0, column=1, sticky="we", padx=(6, 0))
+        ttk.Button(act, text="Save now", command=self.on_save_now).grid(
+            row=1, column=0, sticky="we", pady=(6, 0))
         ttk.Button(act, text="Open data folder", command=self.on_open_folder).grid(
-            row=0, column=3, sticky="we", padx=(6, 0))
+            row=1, column=1, sticky="we", padx=(6, 0), pady=(6, 0))
         self.var_saved = tk.StringVar(value="Nothing saved yet in this session.")
-        ttk.Label(act, textvariable=self.var_saved, style="Hint.TLabel", wraplength=470,
-                  justify="left").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        act.grid_columnconfigure(0, weight=3)
-        for c in (1, 2, 3):
-            act.grid_columnconfigure(c, weight=1)
+        wrapping(ttk.Label(act, textvariable=self.var_saved, style="Hint.TLabel",
+                           wraplength=320, justify="left")).grid(
+            row=2, column=0, columnspan=2, sticky="we", pady=(6, 0))
+        act.grid_columnconfigure(0, weight=1, uniform="act")
+        act.grid_columnconfigure(1, weight=1, uniform="act")
 
         # Instrument settings shared by every measurement
         meas = section(left, "4. Instrument settings (all measurements)")
@@ -981,8 +1003,7 @@ class App(tk.Tk):
             row=3, column=2, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Checkbutton(meas, text="4-wire on drain only", variable=self.var_4w).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        for c in range(4):
-            meas.grid_columnconfigure(c, weight=1)
+        pairs(meas)
 
         # Plot options
         scale = section(left, "5. Plot options")
@@ -995,10 +1016,8 @@ class App(tk.Tk):
         ttk.Checkbutton(scale, text="Show ID+IG panel (leak-corrected)", variable=self.var_show_sum,
                         command=self._toggle_sum_panel).grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(scale, text="Off by default: on a well-insulated gate this trace is identical to "
-                              "ID. The CSV keeps the ID + IG column either way.",
-                  style="Hint.TLabel", wraplength=440, justify="left").grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        hint(scale, "Off by default: on a well-insulated gate this trace is identical to ID. "
+                    "The CSV keeps the ID + IG column either way.", 3, span=2, pady=(4, 0))
         for c in range(2):
             scale.grid_columnconfigure(c, weight=1)
 
@@ -1016,7 +1035,7 @@ class App(tk.Tk):
         # Status
         bar = tk.Frame(self, bg=PALETTE["panel"], highlightthickness=1)
         bar.config(highlightbackground=PALETTE["border"])
-        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 12))
+        bar.pack(side=tk.BOTTOM, fill=tk.X, padx=16, pady=(0, 12), before=card)
         self.var_status = tk.StringVar(value="Ready.")
         ttk.Label(bar, textvariable=self.var_status).pack(side=tk.LEFT, padx=10, pady=6)
         self.var_suppression = tk.StringVar(value="Leak check: waiting for data.")
@@ -1025,6 +1044,35 @@ class App(tk.Tk):
 
         self._on_mode_change()
         self._refresh_legends()
+        self._fit_left_panel()
+
+    def _fit_left_panel(self):
+        """
+        Size the left panel to what its contents need with this PC's fonts and
+        display scaling, and widen the window if the plot would be squeezed.
+        Fonts differ between PCs (Segoe UI on Windows is wider than the
+        Linux default), so a fixed pixel width clipped labels on some screens.
+        """
+        self.update_idletasks()
+        need = self.left_inner.winfo_reqwidth()
+        for tab_id in self.nb.tabs():
+            # Hidden tabs count too: the panel must fit the widest one.
+            need = max(need, self.nametowidget(tab_id).winfo_reqwidth() + 40)
+        self.left_canvas.configure(width=need)
+        self.update_idletasks()
+        left_pane = self.nametowidget(str(self.paned.panes()[0]))
+        left_w = left_pane.winfo_reqwidth()
+        # The divider can widen the panel but never squeeze it below this.
+        self.paned.paneconfigure(left_pane, minsize=left_w)
+        want = left_w + 700
+        screen = self.winfo_screenwidth() - 40
+        w = min(max(want, self.winfo_width(), 1280), screen)
+        self.geometry(f"{w}x{max(self.winfo_height(), 860)}")
+
+    def _on_left_wheel(self, event):
+        # Windows reports multiples of 120 per notch.
+        self.left_canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1),
+                                      "units")
 
     def _on_mode_change(self):
         m = self.var_sweep_mode.get()
