@@ -3,6 +3,45 @@
 Design notes and revision history, moved out of the header of
 `keithley_gating_gui.py` so the code file stays readable. Newest first.
 
+## 2026-11-19.2
+
+LAYOUT
+  - One tab per measurement: Transfer, Output curves, Time trace, Contact
+    check. Each tab holds only its own parameters. VDS for the transfer
+    curve and the time trace is one value shown in both tabs; Settle after
+    ramp moved into the Transfer tab, the only place it is used.
+  - One Start button, in a bar fixed above the scrolling panel, runs the
+    open tab; its label says which measurement it will start. Stop, Save
+    now and Open data folder sit next to it. The per-section Run buttons are
+    gone.
+  - Instrument settings shared by every measurement (compliances, NPLC,
+    delay per point, ramps, gate range, abort on compliance, 4-wire) are in
+    one section, and the plot options in another.
+SAVING
+  - New "Sample and data folder" section. Every run saves into that folder
+    as <sample>_<measurement>_<date>_<time>: .csv and .png for runs that
+    plot data, _summary.txt for runs that make a summary (output curves,
+    contact check). Measurement names: transfer_zero_safe,
+    transfer_hysteresis, transfer_single, output_curves, time_trace,
+    contact_check. The time stamp is taken when the run starts, so all files
+    of one run share it.
+  - Auto-save at the end of each run, on by default, including runs ended
+    with Stop or by compliance. "Save now" saves the last run by hand and
+    rewrites the same files.
+  - With auto-save off, Start asks before a new run replaces an unsaved one.
+  - Sample name, data folder and the auto-save choice are remembered in
+    gui_settings.json next to the program (ignored by git). Default folder:
+    data/ next to the program (also ignored by git).
+  - The Save CSV / Save PNG dialogs and the Save TXT button of the summary
+    window are replaced by the above.
+FIXES
+  - A transfer curve or time trace started after an output-curve run no
+    longer keeps the per-VGS lines in the plot and legend.
+UNCHANGED ON PURPOSE
+  - Measurement code and CSV contents. A hysteresis loop saved with this
+    version matches one saved with 2026-11-17 apart from the version and
+    date lines (checked against a simulated instrument).
+
 ## 2026-11-19
 
 OUTPUT CURVES (new)

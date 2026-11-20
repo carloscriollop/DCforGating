@@ -13,8 +13,12 @@
 # Requires: pyvisa, matplotlib, numpy, tkinter
 
 import os
+import re
 import csv
+import sys
+import json
 import time
+import subprocess
 import queue
 import threading
 import tkinter as tk
@@ -31,7 +35,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Written into every CSV and contact-check report, so each file says which
 # version of this program produced it.
-APP_VERSION = "2026-11-19"
+APP_VERSION = "2026-11-19.2"
 APP_TITLE = f"2636B TSP - ID/IG vs VGS or VDS (A = gate, B = drain)   v{APP_VERSION}"
 APP_SIZE = "1280x860"
 LEFT_PANEL_W = 500
@@ -69,6 +73,46 @@ OUTPUT_LINEAR_PCT = 2.0
 # keeps two loops taken 5 min apart within about 1 % of each other.
 DRIFT_STABLE_PCT_PER_MIN = 0.2
 DRIFT_WINDOW_S = 60.0
+
+# Sample name, data folder and autosave choice survive a restart in this
+# file, next to the program. It is in .gitignore.
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gui_settings.json")
+
+# Measurement name used in file names, per sweep mode.
+RUN_KINDS = {
+    MODE_ZERO_SAFE: "transfer_zero_safe",
+    MODE_HYSTERESIS: "transfer_hysteresis",
+    MODE_SINGLE: "transfer_single",
+    MODE_TRACE: "time_trace",
+    MODE_OUTPUT: "output_curves",
+}
+
+
+def default_data_dir():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as fh:
+            s = json.load(fh)
+        return s if isinstance(s, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_settings(s):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(s, fh, indent=2)
+    except Exception:
+        pass
+
+
+def safe_name(text, fallback="sample"):
+    """Make a sample name safe for a file name: keep letters, digits, . _ -"""
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text).strip()).strip("._")
+    return s or fallback
 
 
 @dataclass
@@ -109,6 +153,11 @@ def apply_style(root):
     s.configure("Warn.TLabel", foreground=PALETTE["warn"])
     s.configure("Header.TLabel", background=PALETTE["bg"], foreground=PALETTE["text"],
                 font=("Segoe UI", 16, "bold"))
+    s.configure("TNotebook", background=PALETTE["panel"], bordercolor=PALETTE["border"])
+    s.configure("TNotebook.Tab", padding=(10, 4))
+    s.map("TNotebook.Tab",
+          background=[("selected", PALETTE["primary"])],
+          foreground=[("selected", "white")])
 
 
 def list_keithley_resources(rm, timeout_ms=1000, include_serial=False):
@@ -648,6 +697,9 @@ class App(tk.Tk):
         self.ax_sum = None
         # Output curves: one (ID, IG, ID+IG) line triple per VGS label.
         self.out_lines = {}
+        # The last measurement started: what to save and under which name.
+        self.run_info = None
+        self.settings = load_settings()
 
         self._build_ui()
         self.after(UI_POLL_MS, self._poll_ui)
@@ -687,15 +739,22 @@ class App(tk.Tk):
     # ===== UI =====
 
     def _build_ui(self):
-        ttk.Label(self, text="ID (top) and IG (bottom) vs VGS, VDS or time, TSP-only",
+        ttk.Label(self, text="CNT gating, Keithley 2636B (TSP)",
                   style="Header.TLabel").pack(side=tk.TOP, anchor="w", padx=18, pady=(16, 8))
 
         card = tk.Frame(self, bg=PALETTE["panel"], highlightthickness=1)
         card.config(highlightbackground=PALETTE["border"])
         card.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=16, pady=8)
 
-        holder = tk.Frame(card, bg=PALETTE["panel"])
-        holder.pack(side=tk.LEFT, fill=tk.Y, padx=(16, 0), pady=16)
+        leftcol = tk.Frame(card, bg=PALETTE["panel"])
+        leftcol.pack(side=tk.LEFT, fill=tk.Y, padx=(16, 0), pady=16)
+        # Fixed bar above the scrolling panel, so Start and Stop are always in view.
+        actbar = tk.Frame(leftcol, bg=PALETTE["panel"], highlightthickness=1,
+                          width=LEFT_PANEL_W + 18)
+        actbar.config(highlightbackground=PALETTE["border"])
+        actbar.pack(side=tk.TOP, fill=tk.X, pady=(0, 6))
+        holder = tk.Frame(leftcol, bg=PALETTE["panel"])
+        holder.pack(side=tk.TOP, fill=tk.Y, expand=True)
         self.left_canvas = tk.Canvas(holder, bg=PALETTE["panel"], highlightthickness=0,
                                      width=LEFT_PANEL_W, borderwidth=0)
         left_sb = ttk.Scrollbar(holder, orient="vertical", command=self.left_canvas.yview)
@@ -730,7 +789,7 @@ class App(tk.Tk):
                 row=row, column=col + 1, sticky="w", padx=(6, 14), pady=pady)
 
         # Connection
-        conn = section(left, "Connection (TSP-only)")
+        conn = section(left, "1. Connection (TSP-only)")
         self.var_resource = tk.StringVar()
         self.cmb_resource = ttk.Combobox(conn, textvariable=self.var_resource, width=42)
         self.cmb_resource.grid(row=0, column=0, columnspan=3, sticky="we", padx=(0, 6))
@@ -742,8 +801,52 @@ class App(tk.Tk):
         for c in range(5):
             conn.grid_columnconfigure(c, weight=1)
 
-        # Sweep
-        prm = section(left, "VGS Sweep (Channel A)")
+        # Sample and data folder
+        sav = section(left, "2. Sample and data folder")
+        self.var_sample = tk.StringVar(value=str(self.settings.get("sample", "sample")))
+        self.var_folder = tk.StringVar(value=str(self.settings.get("folder", default_data_dir())))
+        self.var_autosave = tk.BooleanVar(value=bool(self.settings.get("autosave", True)))
+        ttk.Label(sav, text="Sample name").grid(row=0, column=0, sticky="w")
+        ttk.Entry(sav, textvariable=self.var_sample, width=24).grid(
+            row=0, column=1, sticky="w", padx=(6, 0))
+        ttk.Label(sav, text="Data folder").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(sav, textvariable=self.var_folder, width=40).grid(
+            row=1, column=1, sticky="we", padx=(6, 6), pady=(6, 0))
+        ttk.Button(sav, text="Browse", command=self.on_browse_folder).grid(
+            row=1, column=2, sticky="e", pady=(6, 0))
+        ttk.Checkbutton(sav, text="Auto-save CSV, PNG and summary at the end of each run",
+                        variable=self.var_autosave).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(sav, text="Files are named sample_measurement_date_time, so nothing is "
+                            "overwritten.",
+                  style="Hint.TLabel", wraplength=440, justify="left").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        sav.grid_columnconfigure(1, weight=1)
+
+        # Measurement: one tab per kind of measurement
+        msec = section(left, "3. Measurement (pick a tab, then Start above)")
+        self.nb = ttk.Notebook(msec)
+        self.nb.pack(fill=tk.X)
+
+        def tab(title):
+            outer = tk.Frame(self.nb, bg=PALETTE["panel"])
+            self.nb.add(outer, text=title)
+            inner = tk.Frame(outer, bg=PALETTE["panel"])
+            inner.pack(fill=tk.X, padx=8, pady=8)
+            for c in range(6):
+                inner.grid_columnconfigure(c, weight=1)
+            return inner
+
+        def hint(parent, text, row, span=6):
+            ttk.Label(parent, text=text, style="Hint.TLabel", wraplength=430,
+                      justify="left").grid(row=row, column=0, columnspan=span,
+                                           sticky="w", pady=(6, 0))
+
+        # Shared by the Transfer and Time trace tabs (one variable, two boxes).
+        self.var_vds = tk.StringVar(value="0.05")
+
+        # Tab: transfer curve (VGS sweep)
+        prm = tab("Transfer")
         self.var_start = tk.StringVar(value="-0.5")
         self.var_stop = tk.StringVar(value="0.5")
         self.var_step = tk.StringVar(value="0.02")
@@ -752,89 +855,32 @@ class App(tk.Tk):
         # points jump the full range. Worth it for a fitted slope, not for the
         # shape of a curve.
         self.var_interleave = tk.BooleanVar(value=False)
+        self.var_ramp_wait = tk.StringVar(value="10")
 
-        entry(prm, "Start (V)", self.var_start, 0, 0)
-        entry(prm, "Stop (V)", self.var_stop, 0, 2)
-        entry(prm, "Step (V)", self.var_step, 0, 4)
+        entry(prm, "VGS start (V)", self.var_start, 0, 0)
+        entry(prm, "VGS stop (V)", self.var_stop, 0, 2)
+        entry(prm, "VGS step (V)", self.var_step, 0, 4)
+        entry(prm, "VDS (V)", self.var_vds, 1, 0, pady=(6, 0))
+        entry(prm, "Settle after ramp (s)", self.var_ramp_wait, 1, 2, pady=(6, 0))
 
-        ttk.Label(prm, text="Mode").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(prm, text="Mode").grid(row=2, column=0, sticky="w", pady=(8, 0))
         for i, m in enumerate((MODE_ZERO_SAFE, MODE_HYSTERESIS, MODE_SINGLE)):
             ttk.Radiobutton(prm, text=m, value=m, variable=self.var_sweep_mode,
                             command=self._on_mode_change).grid(
-                row=2 + i // 2, column=(i % 2) * 3, columnspan=3, sticky="w", pady=(2, 0))
+                row=3 + i // 2, column=(i % 2) * 3, columnspan=3, sticky="w", pady=(2, 0))
 
         ttk.Checkbutton(prm, text="Interleave sweep order (for slope fits, not for curve shape)",
                         variable=self.var_interleave,
                         command=self._on_mode_change).grid(
-            row=4, column=0, columnspan=6, sticky="w", pady=(8, 0))
+            row=5, column=0, columnspan=6, sticky="w", pady=(8, 0))
 
-        self.lbl_mode_hint = ttk.Label(prm, text="", style="Hint.TLabel", wraplength=440, justify="left")
-        self.lbl_mode_hint.grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
-        for c in range(6):
-            prm.grid_columnconfigure(c, weight=1)
+        self.lbl_mode_hint = ttk.Label(prm, text="", style="Hint.TLabel", wraplength=430, justify="left")
+        self.lbl_mode_hint.grid(row=6, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        hint(prm, "Settling check: run the same sweep at 0.2 s and at 1.0 s per point. If the "
+                  "curves differ, you are measuring transients, not steady state.", 7)
 
-        # Bias and measurement
-        meas = section(left, "Bias & Measurement")
-        self.var_vds = tk.StringVar(value="0.05")
-        self.var_compA = tk.StringVar(value="1e-6")
-        self.var_compB = tk.StringVar(value="1e-3")
-        self.var_nplc = tk.StringVar(value="1.0")
-        self.var_delay = tk.StringVar(value="0.2")
-        self.var_4w = tk.BooleanVar(value=False)
-        self.var_fix_range = tk.BooleanVar(value=True)
-        self.var_stop_on_comp = tk.BooleanVar(value=True)
-        self.var_ramp_step = tk.StringVar(value="0.02")
-        self.var_ramp_delay = tk.StringVar(value="0.01")
-        self.var_ramp_wait = tk.StringVar(value="10")
-
-        entry(meas, "VDS const (B) (V)", self.var_vds, 0, 0)
-        entry(meas, "Comp A (IG) (A)", self.var_compA, 0, 2)
-        entry(meas, "Comp B (ID) (A)", self.var_compB, 0, 4)
-        entry(meas, "NPLC", self.var_nplc, 1, 0, pady=(6, 0))
-        entry(meas, "Delay per point (s)", self.var_delay, 1, 2, pady=(6, 0))
-        ttk.Checkbutton(meas, text="4-wire on drain only", variable=self.var_4w).grid(
-            row=1, column=4, columnspan=2, sticky="w", pady=(6, 0))
-        entry(meas, "Ramp Step (V)", self.var_ramp_step, 2, 0, pady=(6, 0))
-        entry(meas, "Ramp Delay (s)", self.var_ramp_delay, 2, 2, pady=(6, 0))
-        entry(meas, "Settle after ramp (s)", self.var_ramp_wait, 2, 4, pady=(6, 0))
-
-        ttk.Checkbutton(meas, text="Fix gate source range", variable=self.var_fix_range).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(meas, text="Abort on compliance", variable=self.var_stop_on_comp).grid(
-            row=3, column=3, columnspan=3, sticky="w", pady=(6, 0))
-        for c in range(6):
-            meas.grid_columnconfigure(c, weight=1)
-
-        # Actions
-        act = section(left, "Actions")
-        ttk.Button(act, text="Start", style="Primary.TButton", command=self.on_start).grid(row=0, column=0, sticky="we")
-        ttk.Button(act, text="Stop", command=self.on_stop).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Button(act, text="Save CSV", command=self.on_save_csv).grid(row=1, column=0, sticky="we", pady=(6, 0))
-        ttk.Button(act, text="Save PNG", command=self.on_save_png).grid(row=1, column=1, sticky="we", padx=6, pady=(6, 0))
-        for c in range(2):
-            act.grid_columnconfigure(c, weight=1)
-
-        # Time trace
-        trc = section(left, "Time trace (fixed VGS and VDS)")
-        self.var_trace_vgs = tk.StringVar(value="0.0")
-        self.var_trace_dur = tk.StringVar(value="600")
-        self.var_trace_int = tk.StringVar(value="2.0")
-        entry(trc, "VGS hold (V)", self.var_trace_vgs, 0, 0)
-        entry(trc, "Duration (s)", self.var_trace_dur, 0, 2)
-        entry(trc, "Interval (s)", self.var_trace_int, 0, 4)
-        ttk.Button(trc, text="Run time trace", style="Primary.TButton",
-                   command=self.on_time_trace).grid(row=1, column=0, columnspan=6, sticky="we", pady=(8, 0))
-        ttk.Label(trc, text="Uses VDS, compliances and NPLC from Bias & Measurement. Plots ID and "
-                            "IG against time. Stop ends it early; the data so far can still be "
-                            "saved. The status bar turns to STABLE when ID drifts less than "
-                            f"{DRIFT_STABLE_PCT_PER_MIN:g} %/min.",
-                  style="Hint.TLabel", wraplength=440, justify="left").grid(
-            row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
-        for c in range(6):
-            trc.grid_columnconfigure(c, weight=1)
-
-        # Output curves
-        out = section(left, "Output curves (ID vs VDS at fixed VGS)")
+        # Tab: output curves
+        out = tab("Output curves")
         self.var_out_vgs = tk.StringVar(value="-4, -2, 0, 2, 5")
         self.var_out_vmax = tk.StringVar(value="0.2")
         self.var_out_step = tk.StringVar(value="0.02")
@@ -848,22 +894,27 @@ class App(tk.Tk):
         entry(out, "VDS max +/- (V)", self.var_out_vmax, 1, 0, pady=(6, 0))
         entry(out, "VDS step (V)", self.var_out_step, 1, 2, pady=(6, 0))
         entry(out, "Settle per VGS (s)", self.var_out_settle, 2, 0, pady=(6, 0))
-        ttk.Button(out, text="Run output curves", style="Primary.TButton",
-                   command=self.on_output_curves).grid(row=3, column=0, columnspan=6, sticky="we", pady=(8, 0))
-        ttk.Label(out, text="For each VGS, in the order typed: drain to 0 V, gate ramps to VGS, "
-                            "waits Settle, then VDS goes from -max to +max and back. Repeat a "
-                            "value at the end (e.g. -4, 0, 5, -4) to check the first curve is "
-                            "reproduced. Uses Delay per point, compliances and NPLC from Bias & "
-                            "Measurement. A summary with G, linearity and on/off opens at the end. "
-                            "Straight lines through the origin whose slope changes with VGS mean "
-                            "the gate is modulating the channel.",
-                  style="Hint.TLabel", wraplength=440, justify="left").grid(
-            row=4, column=0, columnspan=6, sticky="w", pady=(6, 0))
-        for c in range(6):
-            out.grid_columnconfigure(c, weight=1)
+        hint(out, "For each VGS, in the order typed: drain to 0 V, gate ramps to VGS, waits "
+                  "Settle, then VDS goes from -max to +max and back. Repeat a value at the end "
+                  "(e.g. -4, 0, 5, -4) to check the first curve is reproduced. Straight lines "
+                  "through the origin whose slope changes with VGS mean the gate is modulating "
+                  "the channel. A summary with G, linearity and on/off opens at the end.", 3)
 
-        # Contact check
-        chk = section(left, "Contact check (R_GS, R_GD, R_DS)")
+        # Tab: time trace
+        trc = tab("Time trace")
+        self.var_trace_vgs = tk.StringVar(value="0.0")
+        self.var_trace_dur = tk.StringVar(value="600")
+        self.var_trace_int = tk.StringVar(value="2.0")
+        entry(trc, "VGS hold (V)", self.var_trace_vgs, 0, 0)
+        entry(trc, "VDS (V)", self.var_vds, 0, 2)
+        entry(trc, "Duration (s)", self.var_trace_dur, 1, 0, pady=(6, 0))
+        entry(trc, "Interval (s)", self.var_trace_int, 1, 2, pady=(6, 0))
+        hint(trc, "Holds VGS and VDS and plots ID and IG against time. Stop ends it early; the "
+                  "data so far is still saved. The status bar turns to STABLE when ID drifts "
+                  f"less than {DRIFT_STABLE_PCT_PER_MIN:g} %/min.", 2)
+
+        # Tab: contact check
+        chk = tab("Contact check")
         self.var_chk_amp = tk.StringVar(value="0.1")
         self.var_chk_pts = tk.StringVar(value="11")
         # Own settle time, independent of the sweep's Delay per point. The
@@ -875,21 +926,66 @@ class App(tk.Tk):
         entry(chk, "Amplitude +/- (V)", self.var_chk_amp, 0, 0)
         entry(chk, "Points per sweep", self.var_chk_pts, 0, 2)
         entry(chk, "Settle per point (s)", self.var_chk_settle, 1, 0, pady=(6, 0))
-        ttk.Button(chk, text="Run contact check", style="Primary.TButton",
-                   command=self.on_contact_check).grid(row=2, column=0, columnspan=4, sticky="we", pady=(8, 0))
-        ttk.Label(chk, text="Two small bipolar sweeps. R_GD is measured twice as a cross-check. "
-                            "Run this FIRST on a new sample, and again on a sample that has been "
-                            "stored: it tells you whether the contacts and the gate dielectric "
-                            "are intact before any real sweep. Settle per point is separate from "
-                            "the sweep delay; keep it near ten gate time constants (10 s on the "
-                            "back-gated HfO2 samples).",
-                  style="Hint.TLabel", wraplength=440, justify="left").grid(
-            row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        for c in range(4):
-            chk.grid_columnconfigure(c, weight=1)
+        hint(chk, "R_GS, R_GD and R_DS from two small bipolar sweeps. Run this FIRST on a new "
+                  "sample, and again on a sample that has been stored. Keep Settle near ten "
+                  "gate time constants (10 s on the back-gated HfO2 samples). Gives a summary "
+                  "only, no plot.", 2)
 
-        # Scale
-        scale = section(left, "Y-Scale")
+        # The Start button runs whichever tab is open.
+        self._tab_runs = [
+            ("Start transfer curve", self.on_start),
+            ("Start output curves", self.on_output_curves),
+            ("Start time trace", self.on_time_trace),
+            ("Start contact check", self.on_contact_check),
+        ]
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
+
+        # Fill the fixed action bar (built above, before the scrolling panel)
+        act = tk.Frame(actbar, bg=PALETTE["panel"])
+        act.pack(fill=tk.X, padx=10, pady=8)
+        self.btn_start = ttk.Button(act, text=self._tab_runs[0][0], style="Primary.TButton",
+                                    command=self.on_run_selected)
+        self.btn_start.grid(row=0, column=0, sticky="we")
+        ttk.Button(act, text="Stop", command=self.on_stop).grid(row=0, column=1, sticky="we", padx=(6, 0))
+        ttk.Button(act, text="Save now", command=self.on_save_now).grid(row=0, column=2, sticky="we", padx=(6, 0))
+        ttk.Button(act, text="Open data folder", command=self.on_open_folder).grid(
+            row=0, column=3, sticky="we", padx=(6, 0))
+        self.var_saved = tk.StringVar(value="Nothing saved yet in this session.")
+        ttk.Label(act, textvariable=self.var_saved, style="Hint.TLabel", wraplength=470,
+                  justify="left").grid(row=1, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        act.grid_columnconfigure(0, weight=3)
+        for c in (1, 2, 3):
+            act.grid_columnconfigure(c, weight=1)
+
+        # Instrument settings shared by every measurement
+        meas = section(left, "4. Instrument settings (all measurements)")
+        self.var_compA = tk.StringVar(value="1e-6")
+        self.var_compB = tk.StringVar(value="1e-3")
+        self.var_nplc = tk.StringVar(value="1.0")
+        self.var_delay = tk.StringVar(value="0.2")
+        self.var_4w = tk.BooleanVar(value=False)
+        self.var_fix_range = tk.BooleanVar(value=True)
+        self.var_stop_on_comp = tk.BooleanVar(value=True)
+        self.var_ramp_step = tk.StringVar(value="0.02")
+        self.var_ramp_delay = tk.StringVar(value="0.01")
+
+        entry(meas, "Comp A (IG) (A)", self.var_compA, 0, 0)
+        entry(meas, "Comp B (ID) (A)", self.var_compB, 0, 2)
+        entry(meas, "NPLC", self.var_nplc, 1, 0, pady=(6, 0))
+        entry(meas, "Delay per point (s)", self.var_delay, 1, 2, pady=(6, 0))
+        entry(meas, "Ramp step (V)", self.var_ramp_step, 2, 0, pady=(6, 0))
+        entry(meas, "Ramp delay (s)", self.var_ramp_delay, 2, 2, pady=(6, 0))
+        ttk.Checkbutton(meas, text="Fix gate source range", variable=self.var_fix_range).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(meas, text="Abort on compliance", variable=self.var_stop_on_comp).grid(
+            row=3, column=2, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(meas, text="4-wire on drain only", variable=self.var_4w).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        for c in range(4):
+            meas.grid_columnconfigure(c, weight=1)
+
+        # Plot options
+        scale = section(left, "5. Plot options")
         ttk.Checkbutton(scale, text="Log |ID| (top)", variable=self.var_log_id,
                         command=self.apply_scales).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(scale, text="Log |IG| (bottom)", variable=self.var_log_ig,
@@ -900,20 +996,11 @@ class App(tk.Tk):
                         command=self._toggle_sum_panel).grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(scale, text="Off by default: on a well-insulated gate this trace is identical to "
-                              "ID. The suppression ratio in the status bar says the same thing in "
-                              "one line, and the CSV keeps the column either way.",
+                              "ID. The CSV keeps the ID + IG column either way.",
                   style="Hint.TLabel", wraplength=440, justify="left").grid(
             row=3, column=0, columnspan=2, sticky="w", pady=(4, 0))
         for c in range(2):
             scale.grid_columnconfigure(c, weight=1)
-
-        ttk.Label(left, text="Sweep order is monotonic by default. Turn on Interleave only when the "
-                            "quantity you want is a fitted slope, not the shape of a curve. The "
-                            "contact check always interleaves, since a resistance is exactly a "
-                            "fitted slope and its amplitude is small.\n"
-                            "Settling check: run the same sweep at 0.2 s and at 1.0 s per point. "
-                            "If the curves differ, you are measuring transients, not steady state.",
-                  style="Hint.TLabel", wraplength=440, justify="left").pack(fill=tk.X, padx=4, pady=(6, 0))
 
         # Plot
         plot = tk.Frame(right, bg=PALETTE["panel"], highlightthickness=1)
@@ -1195,9 +1282,11 @@ class App(tk.Tk):
         self.run_params = dict(p, mode=mode, n_points=len(sweep),
                                started=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.data.clear()
+        self._build_axes()  # drops per-VGS lines left by an output-curve run
         self._refresh_legends()
         self.update_plot()
 
+        self._begin_run(RUN_KINDS[mode])
         self.stop_flag.clear()
         self.var_status.set("Configuring instrument...")
         self.sweep_thread = threading.Thread(target=self._sweep_worker,
@@ -1301,6 +1390,7 @@ class App(tk.Tk):
             self._status(msg + (" Outputs off." if configured else ""))
             if halt_reason and halt_reason.startswith("Aborted"):
                 self._post(lambda m=halt_reason: messagebox.showwarning("Compliance", m))
+            self._post(self._run_done)
 
     def on_stop(self):
         self.stop_flag.set()
@@ -1334,9 +1424,11 @@ class App(tk.Tk):
         self.run_params = dict(p, mode=MODE_TRACE,
                                started=time.strftime("%Y-%m-%d %H:%M:%S"))
         self.data.clear()
+        self._build_axes()  # drops per-VGS lines left by an output-curve run
         self._refresh_legends()
         self.update_plot()
 
+        self._begin_run(RUN_KINDS[MODE_TRACE])
         self.stop_flag.clear()
         self.var_status.set("Configuring instrument...")
         self.sweep_thread = threading.Thread(target=self._trace_worker, args=(p,), daemon=True)
@@ -1401,6 +1493,7 @@ class App(tk.Tk):
             self._status(msg + (" Outputs off." if configured else ""))
             if halt_reason and halt_reason.startswith("Aborted"):
                 self._post(lambda m=halt_reason: messagebox.showwarning("Compliance", m))
+            self._post(self._run_done)
 
     # ===== OUTPUT CURVES =====
 
@@ -1442,6 +1535,7 @@ class App(tk.Tk):
         self.update_plot()
 
         minutes = len(vgs_list) * (p["out_settle"] + len(grid) * p["delay_s"]) / 60.0
+        self._begin_run(RUN_KINDS[MODE_OUTPUT])
         self.stop_flag.clear()
         self.var_status.set(f"Output curves: {len(vgs_list)} VGS values x {len(grid)} points "
                             f"(about {minutes:.1f} min). Configuring instrument...")
@@ -1516,8 +1610,7 @@ class App(tk.Tk):
 
             if curves:
                 report = build_output_report(curves, p, complete=finished)
-                self._post(lambda r=report: self._show_report(
-                    r, title="Output curves", prefix="output_curves"))
+                self._post(lambda r=report: self._set_report(r, "Output curves"))
 
         except Exception as e:
             title = "Output curves failed" if configured else "Configure failed"
@@ -1535,6 +1628,7 @@ class App(tk.Tk):
             self._status(msg + (" Outputs off." if configured else ""))
             if halt_reason and halt_reason.startswith("Aborted"):
                 self._post(lambda m=halt_reason: messagebox.showwarning("Compliance", m))
+            self._post(self._run_done)
 
     # ===== CONTACT CHECK =====
 
@@ -1560,6 +1654,7 @@ class App(tk.Tk):
             return
 
         volts = np.linspace(-amp, amp, pts).tolist()
+        self._begin_run("contact_check", has_plot=False)
         self.stop_flag.clear()
         minutes = 2 * pts * p["chk_settle"] / 60.0
         self.var_status.set(f"Contact check: 2x {pts} pts at +/-{amp:g} V, "
@@ -1606,7 +1701,7 @@ class App(tk.Tk):
             r2 = run(2, "drain", dev.set_vds, dev.ramp_smub_to) if r1 is not None else None
             if r2 is not None:
                 report = self._build_check_report(r1, r2, amp, p)
-                self._post(lambda r=report: self._show_report(r))
+                self._post(lambda r=report: self._set_report(r, "Contact check"))
                 msg = "Contact check finished."
         except Exception as e:
             self._error("Error", f"Check failed:\n{e}")
@@ -1616,6 +1711,7 @@ class App(tk.Tk):
                 dev.zero_and_off(p["ramp_step"], p["ramp_delay"])
             # Reported only after the outputs are actually off.
             self._status(msg + (" Outputs off." if configured else ""))
+            self._post(self._run_done)
 
     @staticmethod
     def _build_check_report(r1, r2, amp, p):
@@ -1707,7 +1803,7 @@ class App(tk.Tk):
                 L.append(f"  {step:>4} {k:>4} {t:>9.2f} {v:>+11.5f} {a:>+12.4e} {b:>+12.4e}")
         return "\n".join(L)
 
-    def _show_report(self, text, title="Contact check", prefix="contact_check"):
+    def _show_report(self, text, title="Contact check"):
         win = tk.Toplevel(self)
         win.title(title)
         win.geometry("820x480")
@@ -1731,29 +1827,10 @@ class App(tk.Tk):
             self.clipboard_append(text)
             self.var_status.set("Report copied.")
 
-        def save():
-            # The report exists only in this window, and a contact check is the
-            # record that a session's data is trustworthy. Timestamped name so
-            # repeated reports never overwrite each other.
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            path = filedialog.asksaveasfilename(
-                parent=win,
-                defaultextension=".txt",
-                initialdir=os.path.dirname(os.path.abspath(__file__)),
-                filetypes=[("Text files", "*.txt")],
-                initialfile=f"{prefix}_{stamp}.txt")
-            if not path:
-                return
-            try:
-                with open(path, "w", encoding="utf-8", newline="") as fh:
-                    fh.write(text if text.endswith("\n") else text + "\n")
-            except Exception as e:
-                messagebox.showerror("Error", f"Could not save report:\n{e}", parent=win)
-                return
-            self.var_status.set(f"Report saved: {os.path.basename(path)}")
-
         ttk.Button(bar, text="Copy", command=copy).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Save TXT", command=save).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(bar, text=f"Saved with this run as {self._run_basename()}_summary.txt "
+                            "(automatically, or with Save now).",
+                  style="Hint.TLabel").pack(side=tk.LEFT, padx=(10, 0))
         ttk.Button(bar, text="Close", command=win.destroy).pack(side=tk.RIGHT)
 
     # ===== PLOTTING =====
@@ -2021,97 +2098,180 @@ class App(tk.Tk):
             vy = max(1e-12, ymax - ymin)
             ax.set_ylim(ymin - 0.1 * vy, ymax + 0.1 * vy)
 
-    # ===== SAVING =====
+    # ===== RUN BOOKKEEPING AND SAVING =====
 
-    def _file_prefix(self):
-        if self.active_mode == MODE_TRACE:
-            return "id_ig_vs_time_TSP"
-        if self.active_mode == MODE_OUTPUT:
-            return "id_ig_vs_vds_TSP"
-        return "id_ig_vs_vgs_TSP"
-
-    def _ask_save(self, ext, label, prefix):
-        stamp = time.strftime("%Y%m%d_%H%M%S")
-        return filedialog.asksaveasfilename(
-            defaultextension=ext,
-            initialdir=os.path.dirname(os.path.abspath(__file__)),
-            filetypes=[(label, f"*{ext}")],
-            initialfile=f"{prefix}_{stamp}{ext}")
-
-    def on_save_csv(self):
-        if not self.data:
-            messagebox.showinfo("Info", "No data to save.")
+    def _on_tab_change(self, event=None):
+        try:
+            i = self.nb.index("current")
+        except Exception:
             return
-        path = self._ask_save(".csv", "CSV files", self._file_prefix())
-        if not path:
+        self.btn_start.config(text=self._tab_runs[i][0])
+
+    def on_run_selected(self):
+        """The Start button: run the measurement of the open tab."""
+        if self.sweep_thread and self.sweep_thread.is_alive():
+            messagebox.showwarning("Notice", "A measurement is already running.")
             return
+        info = self.run_info
+        unsaved = bool(info and not info.get("saved") and
+                       ((info["has_plot"] and self.data) or info["report"]))
+        if unsaved and messagebox.askyesno(
+                "Unsaved measurement",
+                "The last measurement has not been saved and the next one will replace it.\n"
+                "Save it now?"):
+            self._save_run(auto=False)
+        self._tab_runs[self.nb.index("current")][1]()
+
+    def _begin_run(self, kind, has_plot=True):
+        """
+        Called on the GUI thread just before a worker starts. The time stamp
+        is taken here, at the start, so every file of one run shares a name.
+        """
+        self.run_info = {"kind": kind, "stamp": time.strftime("%Y%m%d_%H%M%S"),
+                         "has_plot": has_plot, "report": None, "saved": False,
+                         "sample": safe_name(self.var_sample.get())}
+
+    def _run_basename(self):
+        info = self.run_info or {}
+        return f"{info.get('sample', 'sample')}_{info.get('kind', 'run')}_{info.get('stamp', '')}"
+
+    def _set_report(self, text, title):
+        """Keep the summary of this run for saving, and show it."""
+        if self.run_info is not None:
+            self.run_info["report"] = text
+        self._show_report(text, title=title)
+
+    def _run_done(self):
+        """Posted by every worker as its last action, after the outputs are off."""
+        if self.var_autosave.get():
+            self._save_run(auto=True)
+
+    def _data_folder(self):
+        folder = self.var_folder.get().strip() or default_data_dir()
+        os.makedirs(folder, exist_ok=True)
+        return folder
+
+    def _save_run(self, auto=False):
+        """
+        Save everything the last run produced into the data folder: CSV and
+        PNG when it plotted data, the summary TXT when it made one. Saving the
+        same run again rewrites the same files.
+        """
+        info = self.run_info
+        has_data = bool(info and info["has_plot"] and self.data)
+        has_report = bool(info and info["report"])
+        if not (has_data or has_report):
+            if not auto:
+                messagebox.showinfo("Info", "Nothing to save yet: run a measurement first.")
+            return
+        try:
+            folder = self._data_folder()
+            base = os.path.join(folder, self._run_basename())
+            made = []
+            if has_data:
+                self._write_csv(base + ".csv")
+                self._write_png(base + ".png")
+                made += [".csv", ".png"]
+            if has_report:
+                with open(base + "_summary.txt", "w", encoding="utf-8", newline="") as fh:
+                    r = info["report"]
+                    fh.write(r if r.endswith("\n") else r + "\n")
+                made.append("_summary.txt")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not save in the data folder:\n{e}")
+            return
+        info["saved"] = True
+        self._remember_settings()
+        name = os.path.basename(base)
+        self.var_saved.set(f"Saved {name} ({', '.join(made)}) in {folder}")
+        self.var_status.set(("Auto-saved " if auto else "Saved ") + name)
+
+    def on_save_now(self):
+        self._save_run(auto=False)
+
+    def on_browse_folder(self):
+        start = self.var_folder.get().strip()
+        path = filedialog.askdirectory(
+            initialdir=start if os.path.isdir(start) else os.path.dirname(default_data_dir()),
+            title="Folder for measurement files")
+        if path:
+            self.var_folder.set(path)
+            self._remember_settings()
+
+    def on_open_folder(self):
+        try:
+            folder = self._data_folder()
+            if sys.platform.startswith("win"):
+                os.startfile(folder)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open the folder:\n{e}")
+
+    def _remember_settings(self):
+        self.settings.update(sample=self.var_sample.get().strip(),
+                             folder=self.var_folder.get().strip(),
+                             autosave=bool(self.var_autosave.get()))
+        save_settings(self.settings)
+
+    def _write_png(self, path):
+        self.fig.savefig(path, dpi=150, bbox_inches="tight")
+
+    def _write_csv(self, path):
+        """Write the plotted run as CSV, rows in acquisition order. Raises on error."""
         rp = self.run_params
         read_mode = self.dev.read_mode if self.dev else "unknown"
-        try:
-            # Rows in ACQUISITION order, not sorted by VGS: the order is the
-            # only record of when each point was taken, which is what tells
-            # hysteresis from drift. Plotting sorts its own copy.
-            rows = [p for p in self.data if not p.stitched]
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                f.write(f"# TSP-only (2636B), software v{APP_VERSION}\n")
-                f.write(f"# Started: {rp.get('started', 'n/a')}\n")
-                f.write("# Row order: acquisition order (NOT sorted by VGS)\n")
-                if self.active_mode != MODE_OUTPUT:
-                    f.write(f"# Acquisition order: {'interleaved' if self.active_interleave else 'monotonic'}\n")
-                f.write(f"# Read mode: {read_mode}\n")
-                f.write(f"# Mode: {self.active_mode}\n")
-                if self.active_mode == MODE_OUTPUT:
-                    vgs_txt = ", ".join(f"{v:g}" for v in rp.get("vgs_list", []))
-                    f.write(f"# VGS values in measured order: {vgs_txt}\n")
-                    f.write(f"# VDS from -{rp.get('vds_max')} to +{rp.get('vds_max')} and back, "
-                            f"step={rp.get('vds_step')}, Settle per VGS [s]={rp.get('out_settle')}\n")
-                    f.write("# Segment = the VGS of each curve; VDS_V is the swept quantity.\n")
-                    f.write(f"# Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
-                    f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}\n")
+        # Rows in ACQUISITION order, not sorted by VGS: the order is the
+        # only record of when each point was taken, which is what tells
+        # hysteresis from drift. Plotting sorts its own copy.
+        rows = [p for p in self.data if not p.stitched]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            f.write(f"# TSP-only (2636B), software v{APP_VERSION}\n")
+            f.write(f"# Started: {rp.get('started', 'n/a')}\n")
+            f.write("# Row order: acquisition order (NOT sorted by VGS)\n")
+            if self.active_mode != MODE_OUTPUT:
+                f.write(f"# Acquisition order: {'interleaved' if self.active_interleave else 'monotonic'}\n")
+            f.write(f"# Read mode: {read_mode}\n")
+            f.write(f"# Mode: {self.active_mode}\n")
+            if self.active_mode == MODE_OUTPUT:
+                vgs_txt = ", ".join(f"{v:g}" for v in rp.get("vgs_list", []))
+                f.write(f"# VGS values in measured order: {vgs_txt}\n")
+                f.write(f"# VDS from -{rp.get('vds_max')} to +{rp.get('vds_max')} and back, "
+                        f"step={rp.get('vds_step')}, Settle per VGS [s]={rp.get('out_settle')}\n")
+                f.write("# Segment = the VGS of each curve; VDS_V is the swept quantity.\n")
+                f.write(f"# Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
+                f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}\n")
+            else:
+                f.write(f"# Labels: {self.seg_labels[0]} / {self.seg_labels[1]}\n")
+                if self.active_mode == MODE_TRACE:
+                    f.write(f"# VGS hold={rp.get('vgs_hold')}, Duration [s]={rp.get('duration')}, "
+                            f"Interval [s]={rp.get('interval')}\n")
                 else:
-                    f.write(f"# Labels: {self.seg_labels[0]} / {self.seg_labels[1]}\n")
-                    if self.active_mode == MODE_TRACE:
-                        f.write(f"# VGS hold={rp.get('vgs_hold')}, Duration [s]={rp.get('duration')}, "
-                                f"Interval [s]={rp.get('interval')}\n")
-                    else:
-                        f.write(f"# Start={rp.get('v_start')}, Stop={rp.get('v_stop')}, Step={rp.get('v_step')}\n")
-                    f.write(f"# VDS={rp.get('vds')}, Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
-                    f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}, "
-                            f"Settle after ramp [s]={rp.get('ramp_wait')}\n")
-                f.write(f"# Fixed gate range={rp.get('fix_range')}, 4-wire drain={rp.get('use4')}\n")
-                f.write("# Point_index counts acquisitions from 0; Time_s is seconds since the\n")
-                f.write("#   first point. Use them to separate a direction-dependent effect from a\n")
-                f.write("#   time-dependent one before calling anything hysteresis.\n")
-                f.write("# ID_plus_IG_A = ID + IG, which cancels any current flowing from the gate\n")
-                f.write("#   into the drain. It is an upper bound on real channel modulation, not a\n")
-                f.write("#   measurement of it: a gate leak to source or substrate does not cancel.\n")
-                w = csv.writer(f)
-                w.writerow(["Point_index", "Time_s", "VGS_V", "IG_A", "ID_A",
-                            "ID_plus_IG_A", "VDS_V", "CompA", "CompB", "Segment"])
-                for p in rows:
-                    w.writerow([p.idx, f"{p.t:.4f}", p.vgs, p.ig, p.idrain,
-                                p.idrain + p.ig, p.vds,
-                                int(p.comp_a), int(p.comp_b), p.seg])
-            self.var_status.set(f"Saved CSV to {path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not save:\n{e}")
-
-    def on_save_png(self):
-        if not self.data:
-            messagebox.showinfo("Info", "No data to save.")
-            return
-        path = self._ask_save(".png", "PNG files", self._file_prefix())
-        if not path:
-            return
-        try:
-            self.fig.savefig(path, dpi=150, bbox_inches="tight")
-            self.var_status.set(f"Saved PNG to {path}")
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not save:\n{e}")
+                    f.write(f"# Start={rp.get('v_start')}, Stop={rp.get('v_stop')}, Step={rp.get('v_step')}\n")
+                f.write(f"# VDS={rp.get('vds')}, Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
+                f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}, "
+                        f"Settle after ramp [s]={rp.get('ramp_wait')}\n")
+            f.write(f"# Fixed gate range={rp.get('fix_range')}, 4-wire drain={rp.get('use4')}\n")
+            f.write("# Point_index counts acquisitions from 0; Time_s is seconds since the\n")
+            f.write("#   first point. Use them to separate a direction-dependent effect from a\n")
+            f.write("#   time-dependent one before calling anything hysteresis.\n")
+            f.write("# ID_plus_IG_A = ID + IG, which cancels any current flowing from the gate\n")
+            f.write("#   into the drain. It is an upper bound on real channel modulation, not a\n")
+            f.write("#   measurement of it: a gate leak to source or substrate does not cancel.\n")
+            w = csv.writer(f)
+            w.writerow(["Point_index", "Time_s", "VGS_V", "IG_A", "ID_A",
+                        "ID_plus_IG_A", "VDS_V", "CompA", "CompB", "Segment"])
+            for p in rows:
+                w.writerow([p.idx, f"{p.t:.4f}", p.vgs, p.ig, p.idrain,
+                            p.idrain + p.ig, p.vds,
+                            int(p.comp_a), int(p.comp_b), p.seg])
 
     # ===== SHUTDOWN =====
 
     def on_closing(self):
+        self._remember_settings()
         self.stop_flag.set()
         worker_alive = False
         if self.sweep_thread and self.sweep_thread.is_alive():
