@@ -3,6 +3,38 @@
 Design notes and revision history, moved out of the header of
 `keithley_gating_gui.py` so the code file stays readable. Newest first.
 
+## 2026-11-19
+
+OUTPUT CURVES (new)
+  - ID against VDS at a list of fixed VGS values, typed in measurement order
+    (default -4, -2, 0, 2, 5 V). Answers the question a transfer curve
+    cannot: is the gate changing the channel, or the contacts? Straight
+    lines through the origin whose slope changes with VGS mean the channel;
+    curvature that changes with VGS means gate-modulated contact barriers.
+  - For each VGS: drain ramps to 0 V, gate ramps to VGS, waits "Settle per
+    VGS" (default 60 s, because ID keeps creeping after a gate step on the
+    HfO2 back-gated samples), then VDS goes -max to +max and back (default
+    +/-0.2 V in 0.02 V steps). The there-and-back sequence makes VDS
+    uncorrelated with time, so a slow drift of ID is fitted out of the slope
+    instead of being read as conductance. A one-way ramp cannot separate
+    the two.
+  - A value typed twice (e.g. -4, 0, 5, -4) gets its own curve ("#2"), to
+    check that the first curve is reproduced after the gate has been cycled.
+  - Summary window at the end, saveable as TXT: conductance G per VGS,
+    linearity (slope change between VDS = 0 and +/-max, and +/- asymmetry,
+    from a cubic fit), drain current at VDS = 0 next to the mean gate
+    current, and on/off from the slopes (G max / G min).
+  - Plot: one colour per VGS, x = measured VDS, drawn in acquisition order so
+    both branches of each curve are visible. The status bar compares the
+    largest |IG| with the largest |ID|.
+  - CSV: same columns as a sweep; Segment holds the VGS of each curve. The
+    header lists the VGS order, VDS range, step and settle.
+UNCHANGED ON PURPOSE
+  - Gate sweeps, time trace and contact check, including their CSV headers:
+    a hysteresis loop saved with this version matches one saved with
+    2026-11-17 apart from the version and date lines (checked against a
+    simulated instrument).
+
 ## 2026-11-17
 
 CONTACT CHECK
