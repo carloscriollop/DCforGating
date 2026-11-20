@@ -3,6 +3,33 @@
 Design notes and revision history, moved out of the header of
 `keithley_gating_gui.py` so the code file stays readable. Newest first.
 
+## 2026-11-19.4
+
+COMPLIANCE DETECTION
+  - The compliance flag alone missed a real event on sample 3: IG read
+    -0.99997 uA with a 1 uA limit and VGS sat 68 mV short of its set value,
+    yet CompA was 0 and Abort on compliance did not fire. The leak had
+    relaxed by the time the flag was queried.
+  - Each point now also reads the programmed levels (smua/smub.source.levelv)
+    in the same query. A channel counts as in compliance if the flag is set,
+    OR its current reaches 98 % of the limit, OR its measured voltage is more
+    than 20 mV (+0.5 % of the level) short of the programmed level.
+  - Checked against the sample 3 and sample 4 sweeps of 2026-11-19: the rule
+    flags point 887 of sample 3 and nothing else.
+GATE CURRENT RANGE
+  - Transfer, time trace and output curves now keep the gate current
+    autorange at or above 100 nA (smua.measure.lowrangei). Below that range
+    the 2636B integrates and settles for up to a second per reading, so the
+    loop of a low-leakage sample (sample 4, IG of pA) took 1836 s while the
+    same loop on a leaky one (sample 3) took 1240 s. The slower sweep let the
+    oxide traps relax more and lowered the apparent on/off, so the two could
+    not be compared.
+  - The contact check still autoranges all the way down, because there pA
+    resolution on IG matters more than constant timing.
+  - Cost: IG resolution in those measurements is that of the 100 nA range
+    (a few pA of noise), enough for leakage monitoring.
+  - The CSV header records the floor and the compliance rule.
+
 ## 2026-11-19.3
 
 RESPONSIVE LAYOUT

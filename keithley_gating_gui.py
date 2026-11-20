@@ -35,7 +35,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Written into every CSV and contact-check report, so each file says which
 # version of this program produced it.
-APP_VERSION = "2026-11-19.3"
+APP_VERSION = "2026-11-19.4"
 APP_TITLE = f"2636B TSP - ID/IG vs VGS or VDS (A = gate, B = drain)   v{APP_VERSION}"
 APP_SIZE = "1280x860"
 UI_POLL_MS = 50
@@ -45,6 +45,24 @@ PALETTE = {
     "muted": "#6b7280", "primary": "#2f4858", "primary2": "#3e5f74",
     "warn": "#b45309",
 }
+
+# Gate current autorange never goes below this range in sweeps, time traces
+# and output curves. Below it the 2636B integrates and settles for up to a
+# second per reading, so a sweep on a low-leakage sample ran at half the
+# speed of one on a leaky sample and the two could not be compared. The
+# contact check still autoranges all the way down: it is the one place where
+# pA resolution on IG matters more than constant timing.
+GATE_I_FLOOR_A = 100e-9
+
+# A channel counts as in compliance if the instrument says so, if its current
+# reaches this fraction of the limit, or if the measured voltage falls short
+# of the programmed level by more than COMP_V_TOL_V (+ COMP_V_TOL_REL of the
+# level). The flag alone missed a real event: IG at -0.99997 uA with a 1 uA
+# limit and VGS 68 mV short of its set value, read back as "not in
+# compliance" because the leak had relaxed by the time the flag was queried.
+COMP_I_FRAC = 0.98
+COMP_V_TOL_V = 0.02
+COMP_V_TOL_REL = 0.005
 
 MODE_ZERO_SAFE = "Zero-safe branches"
 MODE_HYSTERESIS = "Hysteresis loop"
@@ -512,16 +530,21 @@ class K2636B_TSP:
     Q_IV = ("local ia, va = smua.measure.iv() "
             "local ib, vb = smub.measure.iv() "
             "print(ia, va, ib, vb, "
-            "smua.source.compliance, smub.source.compliance)")
+            "smua.source.compliance, smub.source.compliance, "
+            "smua.source.levelv, smub.source.levelv)")
     # Fallback: four separate conversions.
     Q_LEGACY = ("local ia, va = smua.measure.i(), smua.measure.v() "
                 "local ib, vb = smub.measure.i(), smub.measure.v() "
                 "print(ia, va, ib, vb, "
-                "smua.source.compliance, smub.source.compliance)")
+                "smua.source.compliance, smub.source.compliance, "
+                "smua.source.levelv, smub.source.levelv)")
 
     def __init__(self, inst):
         self.k = inst
         self._q_point = self.Q_IV
+        # Current limits as configured, for the data-based compliance check.
+        self.limit_a = None
+        self.limit_b = None
 
     @property
     def read_mode(self):
@@ -549,11 +572,14 @@ class K2636B_TSP:
 
     def init_instrument(self, comp_a, comp_b, nplc, use_4w_b, vds_const,
                         fix_source_range=False, vgs_max=1.0,
-                        ramp_step=0.02, ramp_delay=0.01):
+                        ramp_step=0.02, ramp_delay=0.01, gate_i_floor=None):
         """
         Configure both SMUs, check the error queue, then enable the outputs
         and soft-ramp the drain to vds_const. Raises without enabling the
         outputs if the configuration produced any instrument error.
+
+        gate_i_floor: lowest current range the gate autorange may use, in A.
+        None lets it autorange all the way down (contact check).
         """
         w = self._w
 
@@ -571,6 +597,9 @@ class K2636B_TSP:
         w(f"smua.measure.nplc = {float(nplc)}")
         w("smua.measure.autozero = smua.AUTOZERO_AUTO")
         w(f"smua.source.limiti = {float(comp_a)}")
+        if gate_i_floor is not None:
+            w("smua.measure.autorangei = smua.AUTORANGE_ON")
+            w(f"smua.measure.lowrangei = {min(float(gate_i_floor), float(comp_a))}")
         w("smua.sense = smua.SENSE_LOCAL")
         w("smua.source.levelv = 0")
 
@@ -582,6 +611,9 @@ class K2636B_TSP:
         w(f"smub.source.limiti = {float(comp_b)}")
         w("smub.sense = smub.SENSE_REMOTE" if use_4w_b else "smub.sense = smub.SENSE_LOCAL")
         w("smub.source.levelv = 0")
+
+        self.limit_a = float(comp_a)
+        self.limit_b = float(comp_b)
 
         errs = self.drain_errors()
         if errs:
@@ -600,13 +632,30 @@ class K2636B_TSP:
         self._w(f"smub.source.levelv = {float(v)}")
 
     @staticmethod
-    def _parse_point(s):
+    def _flag(x):
+        x = x.strip().lower()
+        return x in ("true", "1", "1.0")
+
+    @staticmethod
+    def _limited(flag, i_meas, limit, v_meas, v_set):
+        """Compliance from the flag OR from the data (see COMP_I_FRAC)."""
+        if flag:
+            return True
+        if limit is not None and abs(i_meas) >= COMP_I_FRAC * limit:
+            return True
+        if v_set is not None and abs(v_meas - v_set) > COMP_V_TOL_V + COMP_V_TOL_REL * abs(v_set):
+            return True
+        return False
+
+    def _parse_point(self, s):
         vs = s.replace(",", " ").split()
         if len(vs) < 6:
-            raise RuntimeError(f"Bad read, expected 6 fields, got: {s}")
+            raise RuntimeError(f"Bad read, expected 8 fields, got: {s}")
         ig, vgs, idrain, vds = (float(x) for x in vs[:4])
-        comp_a = vs[4].strip().lower() == "true"
-        comp_b = vs[5].strip().lower() == "true"
+        set_a = float(vs[6]) if len(vs) >= 8 else None
+        set_b = float(vs[7]) if len(vs) >= 8 else None
+        comp_a = self._limited(self._flag(vs[4]), ig, self.limit_a, vgs, set_a)
+        comp_b = self._limited(self._flag(vs[5]), idrain, self.limit_b, vds, set_b)
         return vgs, ig, idrain, vds, comp_a, comp_b
 
     def read_point(self):
@@ -1367,7 +1416,8 @@ class App(tk.Tk):
                 p["comp_a"], p["comp_b"], p["nplc"], p["use4"], p["vds"],
                 fix_source_range=p["fix_range"],
                 vgs_max=max(abs(p["v_start"]), abs(p["v_stop"])),
-                ramp_step=p["ramp_step"], ramp_delay=p["ramp_delay"])
+                ramp_step=p["ramp_step"], ramp_delay=p["ramp_delay"],
+                gate_i_floor=GATE_I_FLOOR_A)
             configured = True
 
             # Let the dielectric finish charging BEFORE the first point: the
@@ -1501,7 +1551,8 @@ class App(tk.Tk):
                 p["comp_a"], p["comp_b"], p["nplc"], p["use4"], p["vds"],
                 fix_source_range=p["fix_range"],
                 vgs_max=max(abs(p["vgs_hold"]), 0.2),
-                ramp_step=p["ramp_step"], ramp_delay=p["ramp_delay"])
+                ramp_step=p["ramp_step"], ramp_delay=p["ramp_delay"],
+                gate_i_floor=GATE_I_FLOOR_A)
             configured = True
             dev.ramp_smua_to(p["vgs_hold"], p["ramp_step"], p["ramp_delay"])
             self._status(f"Time trace: VGS = {p['vgs_hold']:g} V, VDS = {p['vds']:g} V, "
@@ -1611,7 +1662,8 @@ class App(tk.Tk):
                 p["comp_a"], p["comp_b"], p["nplc"], p["use4"], 0.0,
                 fix_source_range=p["fix_range"],
                 vgs_max=max(max(abs(v) for v in vgs_list), 0.2),
-                ramp_step=rs, ramp_delay=rd)
+                ramp_step=rs, ramp_delay=rd,
+                gate_i_floor=GATE_I_FLOOR_A)
             configured = True
 
             t0 = time.time()
@@ -2301,7 +2353,10 @@ class App(tk.Tk):
                 f.write(f"# VDS={rp.get('vds')}, Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
                 f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}, "
                         f"Settle after ramp [s]={rp.get('ramp_wait')}\n")
-            f.write(f"# Fixed gate range={rp.get('fix_range')}, 4-wire drain={rp.get('use4')}\n")
+            f.write(f"# Fixed gate range={rp.get('fix_range')}, 4-wire drain={rp.get('use4')}, "
+                    f"Gate I autorange floor [A]={GATE_I_FLOOR_A:g}\n")
+            f.write("# CompA/CompB = 1 if the instrument flag was set OR the current reached "
+                    f"{COMP_I_FRAC:g} of the limit OR the voltage fell short of its set value.\n")
             f.write("# Point_index counts acquisitions from 0; Time_s is seconds since the\n")
             f.write("#   first point. Use them to separate a direction-dependent effect from a\n")
             f.write("#   time-dependent one before calling anything hysteresis.\n")
