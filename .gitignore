@@ -210,3 +210,8 @@ __marimo__/
 *.csv
 *.png
 contact_check_*.txt
+*_summary.txt
+data/
+
+# Sample name and data folder remembered by the GUI on this PC
+gui_settings.json
