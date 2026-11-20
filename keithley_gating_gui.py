@@ -1,7 +1,7 @@
-# Keithley 2636B (TSP-only) - ID vs VGS + IG vs VGS (two stacked subplots)
+# Keithley 2636B (TSP-only) - ID and IG vs VGS, VDS or time (stacked subplots)
 #
-# A (smua): sweeps VGS, measures IG and VGS
-# B (smub): holds VDS constant, measures ID and VDS
+# A (smua): drives VGS, measures IG and VGS
+# B (smub): holds or sweeps VDS (output curves), measures ID and VDS
 # TSP-only (no SCPI) to avoid -285/-286. One query per point.
 #
 # SWEEP ORDER: interleave_for_drift is wired into the sweep behind a checkbox
@@ -31,8 +31,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 # Written into every CSV and contact-check report, so each file says which
 # version of this program produced it.
-APP_VERSION = "2026-11-17"
-APP_TITLE = f"2636B TSP - ID/IG vs VGS (A sweeps VGS, B holds VDS)   v{APP_VERSION}"
+APP_VERSION = "2026-11-19"
+APP_TITLE = f"2636B TSP - ID/IG vs VGS or VDS (A = gate, B = drain)   v{APP_VERSION}"
 APP_SIZE = "1280x860"
 LEFT_PANEL_W = 500
 UI_POLL_MS = 50
@@ -47,13 +47,22 @@ MODE_ZERO_SAFE = "Zero-safe branches"
 MODE_HYSTERESIS = "Hysteresis loop"
 MODE_SINGLE = "Single ramp"
 MODE_TRACE = "Time trace"
+MODE_OUTPUT = "Output curves"
 
 SEG_LABELS = {
     MODE_ZERO_SAFE: ("Positive branch", "Negative branch"),
     MODE_HYSTERESIS: ("Forward", "Reverse"),
     MODE_SINGLE: ("Forward", "Reverse"),
     MODE_TRACE: ("Trace", "Unused"),
+    # Output curves carry one segment label per VGS value instead.
+    MODE_OUTPUT: ("Output", "Unused"),
 }
+
+# Output curves: a curve is called LINEAR when the slope changes by less
+# than this many percent between VDS = 0 and VDS = +/-max, and the two VDS
+# polarities differ by less than the same amount. A rule of thumb, not a
+# statistical test: compare curves taken with the same settings.
+OUTPUT_LINEAR_PCT = 2.0
 
 # Time trace: ID is called stable when its rate of change over the last
 # DRIFT_WINDOW_S seconds is below this many percent per minute. 0.2 %/min
@@ -188,6 +197,52 @@ BUILDERS = {
 }
 
 
+def parse_vgs_list(text):
+    """
+    Parse the output-curve gate voltages, e.g. "-4, -2, 0, 2, 5".
+    Commas, semicolons and spaces all separate values. Order is kept as
+    typed, because with gate hysteresis the order changes the result.
+    """
+    parts = text.replace(";", " ").replace(",", " ").split()
+    if not parts:
+        raise ValueError("Enter at least one VGS value.")
+    return [float(x) + 0.0 for x in parts]
+
+
+def output_labels(vgs_list):
+    """
+    One segment label per VGS value. A value that appears again (to check
+    that the first curve is reproduced) gets '#2', '#3', ... so its curve
+    is plotted and reported on its own.
+    """
+    seen = {}
+    out = []
+    for v in vgs_list:
+        seen[v] = seen.get(v, 0) + 1
+        out.append(f"VGS {v:+g} V" + (f" #{seen[v]}" if seen[v] > 1 else ""))
+    return out
+
+
+def build_output_vds_grid(vmax, step):
+    """
+    VDS from -vmax to +vmax and back over the same grid.
+
+    The sequence is a palindrome, so the applied VDS is uncorrelated with
+    time. That lets fit_conductance() separate a slow drift of ID from the
+    slope, which a one-way ramp cannot do (there, drift and slope are the
+    same straight line in time). Adjacent points still differ by one step,
+    so the gate capacitor is barely disturbed. The turning point at +vmax is
+    measured twice, back to back, as in the hysteresis loop.
+    """
+    vmax, step = abs(float(vmax)), abs(float(step))
+    if vmax == 0 or step == 0:
+        raise ValueError("VDS max and VDS step must be non-zero.")
+    if step > vmax:
+        raise ValueError("VDS step must not exceed VDS max.")
+    up = _arange_inclusive(-vmax, vmax, step)
+    return up + list(reversed(up))
+
+
 # ===== FITTING & ANALYSIS =====
 
 def eng_ohms(r):
@@ -287,6 +342,114 @@ def resistance_from_fit(fit, k_sigma=3.0):
     if r < 0:
         return r, f"{eng_ohms(abs(r))} (NEGATIVE slope)", True
     return r, eng_ohms(r), True
+
+
+def analyze_output_curve(vds, idrain, ig, t):
+    """
+    Summarize one output curve (ID against VDS at fixed VGS).
+
+    g, r2, i0, drift: straight-line fit i = g*v + drift*(t - t_mean) + i0.
+        g is the channel conductance at this VGS; i0 is the drain current
+        at VDS = 0 (a pure resistor gives zero there).
+    curv_pct: how much the slope at VDS = +/-max differs from the slope at
+        VDS = 0, in percent. From a cubic fit, i = g1*v + g2*v^2 + g3*v^3
+        plus the same drift term; the slope is g1 + 2*g2*v + 3*g3*v^2, so
+        the symmetric change is 3*g3*vmax^2 / g1.
+    asym_pct: difference between the +VDS and -VDS sides, 2*g2*vmax / g1.
+    """
+    v = np.asarray(vds, dtype=float)
+    i = np.asarray(idrain, dtype=float)
+    a = np.asarray(ig, dtype=float)
+    tt = np.asarray(t, dtype=float)
+    ok = np.isfinite(v) & np.isfinite(i) & np.isfinite(tt)
+    v, i, tt = v[ok], i[ok], tt[ok]
+    a = a[np.isfinite(a)]
+
+    lin = fit_conductance(v, i, tt)
+    res = {
+        "n": int(v.size), "g": lin.g, "g_err": lin.g_err, "r2": lin.r2,
+        "i0": lin.i0, "drift": lin.drift,
+        "curv_pct": np.nan, "asym_pct": np.nan,
+        "vmax": float(np.max(np.abs(v))) if v.size else np.nan,
+        "id_max": float(np.max(np.abs(i))) if i.size else np.nan,
+        "ig_mean": float(np.mean(a)) if a.size else np.nan,
+        "ig_max": float(np.max(np.abs(a))) if a.size else np.nan,
+    }
+    if v.size >= 7 and np.isfinite(lin.g) and lin.g != 0:
+        X = np.column_stack([v, v ** 2, v ** 3, tt - tt.mean(), np.ones_like(v)])
+        try:
+            beta, *_ = np.linalg.lstsq(X, i, rcond=None)
+            g1, g2, g3 = (float(b) for b in beta[:3])
+            vm = res["vmax"]
+            if g1 != 0:
+                res["curv_pct"] = 3.0 * g3 * vm ** 2 / g1 * 100.0
+                res["asym_pct"] = 2.0 * g2 * vm / g1 * 100.0
+        except np.linalg.LinAlgError:
+            pass
+    return res
+
+
+def build_output_report(curves, p, complete=True):
+    """
+    Plain-text summary of a set of output curves.
+    curves: list of (label, vgs_set, vds, id, ig, t), in measurement order.
+    """
+    rows = [(lab, vg, analyze_output_curve(vd, idr, ig, t))
+            for lab, vg, vd, idr, ig, t in curves]
+
+    L = []
+    L.append("OUTPUT CURVES   " + time.strftime("%Y-%m-%d %H:%M:%S")
+             + f"   (software v{APP_VERSION})")
+    L.append(f"VDS -{p['vds_max']:g} V to +{p['vds_max']:g} V and back, step "
+             f"{p['vds_step']:g} V, {p['delay_s']:g} s per point, NPLC {p['nplc']:g}")
+    L.append(f"Settle at each VGS before its curve: {p['out_settle']:g} s (VDS = 0 V meanwhile)")
+    L.append(f"Compliance: gate {p['comp_a']:g} A, drain {p['comp_b']:g} A")
+    L.append("VGS order as measured: " + ", ".join(f"{vg:+g}" for _, vg, _ in rows))
+    if not complete:
+        L.append("** RUN DID NOT FINISH: the last curve may be partial.")
+    L.append("")
+
+    head = (f"  {'curve':<14} {'G (S)':>11} {'R':>12} {'R2 line':>9} "
+            f"{'curv %':>7} {'asym %':>7} {'ID@VDS=0 (A)':>13} {'IG mean (A)':>12}  verdict")
+    L.append(head)
+    good = []
+    for lab, vg, r in rows:
+        g = r["g"]
+        r_str = eng_ohms(1.0 / g) if np.isfinite(g) and g != 0 else "n/a"
+        lin_ok = (np.isfinite(r["curv_pct"]) and np.isfinite(r["asym_pct"])
+                  and abs(r["curv_pct"]) < OUTPUT_LINEAR_PCT
+                  and abs(r["asym_pct"]) < OUTPUT_LINEAR_PCT)
+        verdict = "LINEAR" if lin_ok else ("too few points" if r["n"] < 7 else "CHECK")
+        L.append(f"  {lab:<14} {g:>11.4e} {r_str:>12} {r['r2']:>9.6f} "
+                 f"{r['curv_pct']:>+7.2f} {r['asym_pct']:>+7.2f} "
+                 f"{r['i0']:>+13.3e} {r['ig_mean']:>+12.3e}  {verdict}")
+        if np.isfinite(g) and g > 0:
+            good.append((g, lab))
+    L.append("")
+
+    if len(good) >= 2:
+        g_hi, lab_hi = max(good)
+        g_lo, lab_lo = min(good)
+        L.append(f"On/off from slopes: G max / G min = {g_hi / g_lo:.3f}x "
+                 f"({lab_hi} / {lab_lo})")
+        L.append("  Independent of the transfer curve: each G uses the whole VDS range,")
+        L.append("  not one VDS value, and drift during the curve is fitted out.")
+        L.append("")
+
+    L.append("How to read this")
+    L.append("  G: slope of ID against VDS, the channel conductance at that VGS.")
+    L.append("  curv %: how much the slope changes between VDS = 0 and VDS = +/-max.")
+    L.append("    Near 0 means a straight line, i.e. ohmic contacts. A curvature that")
+    L.append("    changes with VGS means the gate is acting on the contacts, not only")
+    L.append("    on the channel.")
+    L.append("  asym %: difference between the +VDS and -VDS sides. Near 0 means the")
+    L.append("    two contacts behave alike.")
+    L.append("  ID@VDS=0: drain current with no drain bias. It should be small next to")
+    L.append("    the current at VDS max. If it follows IG, gate leakage reaches the drain.")
+    L.append(f"  LINEAR: |curv| and |asym| both below {OUTPUT_LINEAR_PCT:g} %. A rule of thumb.")
+    L.append("")
+    L.append("Raw points: use Save CSV (one Segment label per VGS).")
+    return "\n".join(L)
 
 
 # ===== INSTRUMENT CONTROL =====
@@ -483,6 +646,8 @@ class App(tk.Tk):
         self.var_clip_log = tk.BooleanVar(value=False)
         self.var_show_sum = tk.BooleanVar(value=False)
         self.ax_sum = None
+        # Output curves: one (ID, IG, ID+IG) line triple per VGS label.
+        self.out_lines = {}
 
         self._build_ui()
         self.after(UI_POLL_MS, self._poll_ui)
@@ -522,7 +687,7 @@ class App(tk.Tk):
     # ===== UI =====
 
     def _build_ui(self):
-        ttk.Label(self, text="ID-VGS (top) and IG-VGS (bottom), TSP-only",
+        ttk.Label(self, text="ID (top) and IG (bottom) vs VGS, VDS or time, TSP-only",
                   style="Header.TLabel").pack(side=tk.TOP, anchor="w", padx=18, pady=(16, 8))
 
         card = tk.Frame(self, bg=PALETTE["panel"], highlightthickness=1)
@@ -668,6 +833,35 @@ class App(tk.Tk):
         for c in range(6):
             trc.grid_columnconfigure(c, weight=1)
 
+        # Output curves
+        out = section(left, "Output curves (ID vs VDS at fixed VGS)")
+        self.var_out_vgs = tk.StringVar(value="-4, -2, 0, 2, 5")
+        self.var_out_vmax = tk.StringVar(value="0.2")
+        self.var_out_step = tk.StringVar(value="0.02")
+        # Long by default: after a gate step, ID on the HfO2 back-gated
+        # samples keeps creeping (29 % loop hysteresis on sample 2), and a
+        # curve taken while ID creeps mixes drift into the slope.
+        self.var_out_settle = tk.StringVar(value="60")
+        ttk.Label(out, text="VGS values (V)").grid(row=0, column=0, sticky="w")
+        ttk.Entry(out, textvariable=self.var_out_vgs, width=30).grid(
+            row=0, column=1, columnspan=5, sticky="we", padx=(6, 0))
+        entry(out, "VDS max +/- (V)", self.var_out_vmax, 1, 0, pady=(6, 0))
+        entry(out, "VDS step (V)", self.var_out_step, 1, 2, pady=(6, 0))
+        entry(out, "Settle per VGS (s)", self.var_out_settle, 2, 0, pady=(6, 0))
+        ttk.Button(out, text="Run output curves", style="Primary.TButton",
+                   command=self.on_output_curves).grid(row=3, column=0, columnspan=6, sticky="we", pady=(8, 0))
+        ttk.Label(out, text="For each VGS, in the order typed: drain to 0 V, gate ramps to VGS, "
+                            "waits Settle, then VDS goes from -max to +max and back. Repeat a "
+                            "value at the end (e.g. -4, 0, 5, -4) to check the first curve is "
+                            "reproduced. Uses Delay per point, compliances and NPLC from Bias & "
+                            "Measurement. A summary with G, linearity and on/off opens at the end. "
+                            "Straight lines through the origin whose slope changes with VGS mean "
+                            "the gate is modulating the channel.",
+                  style="Hint.TLabel", wraplength=440, justify="left").grid(
+            row=4, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        for c in range(6):
+            out.grid_columnconfigure(c, weight=1)
+
         # Contact check
         chk = section(left, "Contact check (R_GS, R_GD, R_DS)")
         self.var_chk_amp = tk.StringVar(value="0.1")
@@ -811,6 +1005,8 @@ class App(tk.Tk):
         self.line_id_a, self.line_id_b = pair(self.ax_id)
         self.line_ig_a, self.line_ig_b = pair(self.ax_ig)
         self.line_sum_a, self.line_sum_b = pair(self.ax_sum) if show_sum else (None, None)
+        # The figure was cleared, so any per-VGS lines are gone too.
+        self.out_lines = {}
         self._apply_scale_settings()
 
     def _apply_scale_settings(self):
@@ -830,10 +1026,14 @@ class App(tk.Tk):
     def _refresh_legends(self):
         a, b = self.seg_labels
         trace = (self.active_mode == MODE_TRACE)
+        output = (self.active_mode == MODE_OUTPUT)
 
         def lab(q, s):
-            # A label starting with "_" is hidden from the legend.
-            return "_nolegend_" if (trace and s == b) else f"{q} ({s})"
+            # A label starting with "_" is hidden from the legend. In output
+            # mode the fixed pair is unused; the per-VGS lines carry labels.
+            if output or (trace and s == b):
+                return "_nolegend_"
+            return f"{q} ({s})"
 
         self.line_id_a.set_label(lab("ID", a))
         self.line_id_b.set_label(lab("ID", b))
@@ -844,8 +1044,14 @@ class App(tk.Tk):
             self.line_sum_a.set_label(lab("ID+IG", a))
             self.line_sum_b.set_label(lab("ID+IG", b))
             axes.append(self.ax_sum)
-        axes[-1].set_xlabel("Time (s)" if trace else "VGS (V)")
+        axes[-1].set_xlabel("Time (s)" if trace else "VDS (V)" if output else "VGS (V)")
         for ax in axes:
+            handles, labels = ax.get_legend_handles_labels()
+            if not handles:
+                # Output mode before the first curve: nothing labelled yet.
+                if ax.get_legend() is not None:
+                    ax.get_legend().remove()
+                continue
             leg = ax.legend(frameon=True, fontsize=8)
             leg.get_frame().set_edgecolor(PALETTE["border"])
             leg.get_frame().set_facecolor("#ffffff")
@@ -1196,6 +1402,140 @@ class App(tk.Tk):
             if halt_reason and halt_reason.startswith("Aborted"):
                 self._post(lambda m=halt_reason: messagebox.showwarning("Compliance", m))
 
+    # ===== OUTPUT CURVES =====
+
+    def on_output_curves(self):
+        if not self.dev:
+            messagebox.showwarning("Notice", "Connect first (TSP).")
+            return
+        if self._busy():
+            return
+        try:
+            p = self._read_common()
+            vgs_list = parse_vgs_list(self.var_out_vgs.get())
+            p["vds_max"] = abs(float(self.var_out_vmax.get()))
+            p["vds_step"] = abs(float(self.var_out_step.get()))
+            p["out_settle"] = float(self.var_out_settle.get())
+            p["stop_on_comp"] = bool(self.var_stop_on_comp.get())
+            grid = build_output_vds_grid(p["vds_max"], p["vds_step"])
+        except Exception as e:
+            messagebox.showerror("Error", f"Invalid entry:\n{e}")
+            return
+        if p["out_settle"] < 0:
+            messagebox.showerror("Error", "Settle per VGS cannot be negative.")
+            return
+        if p["comp_a"] > 1e-5 and not messagebox.askyesno(
+                "Confirm gate compliance",
+                f"Gate compliance is {p['comp_a']:g} A (high for a leaky gate).\nContinue?"):
+            return
+
+        labels = output_labels(vgs_list)
+        p["vgs_list"] = vgs_list
+        self.active_mode = MODE_OUTPUT
+        self.active_interleave = False
+        self.seg_labels = SEG_LABELS[MODE_OUTPUT]
+        self.run_params = dict(p, mode=MODE_OUTPUT, n_points=len(grid) * len(vgs_list),
+                               started=time.strftime("%Y-%m-%d %H:%M:%S"))
+        self.data.clear()
+        self._build_axes()
+        self._refresh_legends()
+        self.update_plot()
+
+        minutes = len(vgs_list) * (p["out_settle"] + len(grid) * p["delay_s"]) / 60.0
+        self.stop_flag.clear()
+        self.var_status.set(f"Output curves: {len(vgs_list)} VGS values x {len(grid)} points "
+                            f"(about {minutes:.1f} min). Configuring instrument...")
+        self.sweep_thread = threading.Thread(target=self._output_worker,
+                                             args=(vgs_list, labels, grid, p), daemon=True)
+        self.sweep_thread.start()
+
+    def _output_worker(self, vgs_list, labels, grid, p):
+        """
+        Same thread rules as the sweep worker: no tkinter here, everything
+        goes back through self._post(). The drain returns to 0 V before
+        every gate move, so the gate always settles with no drain bias and
+        each curve starts from the same state.
+        """
+        dev = self.dev
+        wait = self.stop_flag.wait
+        rs, rd = p["ramp_step"], p["ramp_delay"]
+        n = len(vgs_list)
+        curves = []
+        halt_reason = None
+        configured = False
+        finished = False
+        try:
+            dev.init_instrument(
+                p["comp_a"], p["comp_b"], p["nplc"], p["use4"], 0.0,
+                fix_source_range=p["fix_range"],
+                vgs_max=max(max(abs(v) for v in vgs_list), 0.2),
+                ramp_step=rs, ramp_delay=rd)
+            configured = True
+
+            t0 = time.time()
+            idx = 0
+            for k, (vg, label) in enumerate(zip(vgs_list, labels), start=1):
+                if self.stop_flag.is_set():
+                    break
+                dev.ramp_smub_to(0.0, rs, rd)
+                dev.ramp_smua_to(vg, rs, rd)
+                self._status(f"Output curve {k}/{n}: VGS = {vg:+g} V, settling "
+                             f"{p['out_settle']:g} s with VDS = 0...")
+                if wait(p["out_settle"]):
+                    break
+                dev.ramp_smub_to(grid[0], rs, rd)
+                self._status(f"Output curve {k}/{n}: VGS = {vg:+g} V, sweeping VDS "
+                             f"+/-{p['vds_max']:g} V...")
+
+                vds_l, id_l, ig_l, t_l = [], [], [], []
+                for v in grid:
+                    dev.set_vds(v)
+                    if wait(p["delay_s"]):
+                        break
+                    vgs_m, ig, idr, vds_m, ca, cb = dev.read_point()
+                    t_now = time.time() - t0
+                    self._post(Point(vgs_m, ig, idr, vds_m, ca, cb, label, False,
+                                     idx=idx, t=t_now))
+                    idx += 1
+                    vds_l.append(vds_m)
+                    id_l.append(idr)
+                    ig_l.append(ig)
+                    t_l.append(t_now)
+                    if (ca or cb) and p["stop_on_comp"]:
+                        which = ("gate (A) and drain (B)" if ca and cb
+                                 else "gate (A)" if ca else "drain (B)")
+                        halt_reason = (f"Aborted at VGS = {vg:+g} V, VDS = {vds_m:.4g} V: "
+                                       f"{which} in compliance. IG = {ig:.4g} A, ID = {idr:.4g} A.")
+                        break
+                if vds_l:
+                    curves.append((label, vg, vds_l, id_l, ig_l, t_l))
+                if halt_reason or self.stop_flag.is_set():
+                    break
+            else:
+                finished = True
+
+            if curves:
+                report = build_output_report(curves, p, complete=finished)
+                self._post(lambda r=report: self._show_report(
+                    r, title="Output curves", prefix="output_curves"))
+
+        except Exception as e:
+            title = "Output curves failed" if configured else "Configure failed"
+            self._error("Error", f"{title}:\n{e}")
+            halt_reason = halt_reason or f"{title}."
+        finally:
+            if configured:
+                dev.zero_and_off(rs, rd)
+            if halt_reason:
+                msg = halt_reason
+            elif finished:
+                msg = "Output curves finished."
+            else:
+                msg = "Output curves stopped."
+            self._status(msg + (" Outputs off." if configured else ""))
+            if halt_reason and halt_reason.startswith("Aborted"):
+                self._post(lambda m=halt_reason: messagebox.showwarning("Compliance", m))
+
     # ===== CONTACT CHECK =====
 
     def on_contact_check(self):
@@ -1367,9 +1707,9 @@ class App(tk.Tk):
                 L.append(f"  {step:>4} {k:>4} {t:>9.2f} {v:>+11.5f} {a:>+12.4e} {b:>+12.4e}")
         return "\n".join(L)
 
-    def _show_report(self, text):
+    def _show_report(self, text, title="Contact check", prefix="contact_check"):
         win = tk.Toplevel(self)
-        win.title("Contact check")
+        win.title(title)
         win.geometry("820x480")
         frame = tk.Frame(win, bg=PALETTE["panel"])
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
@@ -1394,14 +1734,14 @@ class App(tk.Tk):
         def save():
             # The report exists only in this window, and a contact check is the
             # record that a session's data is trustworthy. Timestamped name so
-            # repeated checks never overwrite each other.
+            # repeated reports never overwrite each other.
             stamp = time.strftime("%Y%m%d_%H%M%S")
             path = filedialog.asksaveasfilename(
                 parent=win,
                 defaultextension=".txt",
                 initialdir=os.path.dirname(os.path.abspath(__file__)),
                 filetypes=[("Text files", "*.txt")],
-                initialfile=f"contact_check_{stamp}.txt")
+                initialfile=f"{prefix}_{stamp}.txt")
             if not path:
                 return
             try:
@@ -1460,7 +1800,69 @@ class App(tk.Tk):
         order = np.argsort(vx)
         return vx[order], idr[order], ig[order], s[order]
 
+    def _output_line_triple(self, label):
+        """Create, on first use, the ID / IG / ID+IG lines for one VGS."""
+        if label not in self.out_lines:
+            color = f"C{len(self.out_lines) % 10}"
+            kw = dict(marker="o", markersize=3, linestyle="-", linewidth=1.3, color=color)
+            lid, = self.ax_id.plot([], [], label=label, **kw)
+            lig, = self.ax_ig.plot([], [], label=label, **kw)
+            lsum = None
+            if self.ax_sum is not None:
+                lsum, = self.ax_sum.plot([], [], label=label, **kw)
+            self.out_lines[label] = (lid, lig, lsum)
+        return self.out_lines[label]
+
+    def _update_output_plot(self):
+        """
+        One line per VGS, x = measured VDS, in ACQUISITION order (not sorted),
+        so the -max -> +max -> -max loop shows: two branches that sit on top of
+        each other mean no drift or hysteresis during the curve.
+        """
+        for ln in (self.line_id_a, self.line_id_b, self.line_ig_a, self.line_ig_b,
+                   self.line_sum_a, self.line_sum_b):
+            if ln is not None:
+                ln.set_data([], [])
+
+        groups = {}
+        for p in self.data:
+            groups.setdefault(p.seg, []).append(p)
+
+        n_before = len(self.out_lines)
+        xs, ids, igs, sums = [], [], [], []
+        for label, pts in groups.items():
+            lid, lig, lsum = self._output_line_triple(label)
+            vx = np.asarray([p.vds for p in pts], dtype=float)
+            idr = np.asarray([p.idrain for p in pts], dtype=float)
+            ig = np.asarray([p.ig for p in pts], dtype=float)
+            s = idr + ig
+            if self.var_log_id.get():
+                idr = self._prep_for_log(idr)
+            if self.var_log_ig.get():
+                ig = self._prep_for_log(ig)
+            lid.set_data(vx, idr)
+            lig.set_data(vx, ig)
+            if lsum is not None:
+                lsum.set_data(vx, s)
+            xs.append(vx)
+            ids.append(idr)
+            igs.append(ig)
+            sums.append(s)
+
+        if len(self.out_lines) != n_before:
+            self._refresh_legends()
+        if xs:
+            self._autoscale(self.ax_id, xs, ids)
+            self._autoscale(self.ax_ig, xs, igs)
+            if self.ax_sum is not None:
+                self._autoscale(self.ax_sum, xs, sums)
+        self._update_suppression()
+        self.canvas.draw_idle()
+
     def update_plot(self):
+        if self.active_mode == MODE_OUTPUT:
+            self._update_output_plot()
+            return
         lab_a, lab_b = self.seg_labels
         xa, ya, ga, sa = self._branch_arrays(self._seg(lab_a))
         xb, yb, gb, sb = self._branch_arrays(self._seg(lab_b))
@@ -1491,6 +1893,22 @@ class App(tk.Tk):
         """
         if self.active_mode == MODE_TRACE:
             self.var_suppression.set(self._drift_status())
+            return
+        if self.active_mode == MODE_OUTPUT:
+            # Here ID swings because VDS is swept, so the swing comparison
+            # below means nothing. Compare the largest gate and drain
+            # currents instead.
+            idr = np.array([abs(p.idrain) for p in self.data], dtype=float)
+            ig = np.array([abs(p.ig) for p in self.data], dtype=float)
+            idr, ig = idr[np.isfinite(idr)], ig[np.isfinite(ig)]
+            if not (idr.size and ig.size):
+                self.var_suppression.set("Leak check: waiting for data.")
+            elif ig.max() > 0:
+                self.var_suppression.set(
+                    f"Leak check: max |IG| {ig.max():.3e} A, max |ID| {idr.max():.3e} A "
+                    f"({idr.max() / ig.max():.0f}x)")
+            else:
+                self.var_suppression.set("Leak check: IG reads zero.")
             return
         raw = np.array([p.idrain for p in self.data], dtype=float)
         cor = np.array([p.idrain + p.ig for p in self.data], dtype=float)
@@ -1606,7 +2024,11 @@ class App(tk.Tk):
     # ===== SAVING =====
 
     def _file_prefix(self):
-        return "id_ig_vs_time_TSP" if self.active_mode == MODE_TRACE else "id_ig_vs_vgs_TSP"
+        if self.active_mode == MODE_TRACE:
+            return "id_ig_vs_time_TSP"
+        if self.active_mode == MODE_OUTPUT:
+            return "id_ig_vs_vds_TSP"
+        return "id_ig_vs_vgs_TSP"
 
     def _ask_save(self, ext, label, prefix):
         stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -1634,18 +2056,28 @@ class App(tk.Tk):
                 f.write(f"# TSP-only (2636B), software v{APP_VERSION}\n")
                 f.write(f"# Started: {rp.get('started', 'n/a')}\n")
                 f.write("# Row order: acquisition order (NOT sorted by VGS)\n")
-                f.write(f"# Acquisition order: {'interleaved' if self.active_interleave else 'monotonic'}\n")
+                if self.active_mode != MODE_OUTPUT:
+                    f.write(f"# Acquisition order: {'interleaved' if self.active_interleave else 'monotonic'}\n")
                 f.write(f"# Read mode: {read_mode}\n")
                 f.write(f"# Mode: {self.active_mode}\n")
-                f.write(f"# Labels: {self.seg_labels[0]} / {self.seg_labels[1]}\n")
-                if self.active_mode == MODE_TRACE:
-                    f.write(f"# VGS hold={rp.get('vgs_hold')}, Duration [s]={rp.get('duration')}, "
-                            f"Interval [s]={rp.get('interval')}\n")
+                if self.active_mode == MODE_OUTPUT:
+                    vgs_txt = ", ".join(f"{v:g}" for v in rp.get("vgs_list", []))
+                    f.write(f"# VGS values in measured order: {vgs_txt}\n")
+                    f.write(f"# VDS from -{rp.get('vds_max')} to +{rp.get('vds_max')} and back, "
+                            f"step={rp.get('vds_step')}, Settle per VGS [s]={rp.get('out_settle')}\n")
+                    f.write("# Segment = the VGS of each curve; VDS_V is the swept quantity.\n")
+                    f.write(f"# Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
+                    f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}\n")
                 else:
-                    f.write(f"# Start={rp.get('v_start')}, Stop={rp.get('v_stop')}, Step={rp.get('v_step')}\n")
-                f.write(f"# VDS={rp.get('vds')}, Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
-                f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}, "
-                        f"Settle after ramp [s]={rp.get('ramp_wait')}\n")
+                    f.write(f"# Labels: {self.seg_labels[0]} / {self.seg_labels[1]}\n")
+                    if self.active_mode == MODE_TRACE:
+                        f.write(f"# VGS hold={rp.get('vgs_hold')}, Duration [s]={rp.get('duration')}, "
+                                f"Interval [s]={rp.get('interval')}\n")
+                    else:
+                        f.write(f"# Start={rp.get('v_start')}, Stop={rp.get('v_stop')}, Step={rp.get('v_step')}\n")
+                    f.write(f"# VDS={rp.get('vds')}, Comp_A={rp.get('comp_a')}, Comp_B={rp.get('comp_b')}\n")
+                    f.write(f"# NPLC={rp.get('nplc')}, Delay per point [s]={rp.get('delay_s')}, "
+                            f"Settle after ramp [s]={rp.get('ramp_wait')}\n")
                 f.write(f"# Fixed gate range={rp.get('fix_range')}, 4-wire drain={rp.get('use4')}\n")
                 f.write("# Point_index counts acquisitions from 0; Time_s is seconds since the\n")
                 f.write("#   first point. Use them to separate a direction-dependent effect from a\n")
