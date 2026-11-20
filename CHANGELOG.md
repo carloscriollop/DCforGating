@@ -3,6 +3,26 @@
 Design notes and revision history, moved out of the header of
 `keithley_gating_gui.py` so the code file stays readable. Newest first.
 
+## 2026-11-19.3
+
+RESPONSIVE LAYOUT
+  - Labels were clipped on the lab PC ("VGS start (\", "Settle after ramp
+    ("): the left panel had a fixed width of 500 px, three label/entry pairs
+    per row in equal columns, and Segoe UI on Windows is wider than the font
+    the layout was checked with.
+  - The left panel now starts as wide as its contents need with the fonts
+    and display scaling of the PC it runs on, and the window widens if
+    needed. A divider between the panel and the plot can be dragged to give
+    either one more room; it never squeezes the panel below that width.
+  - At most two label/entry pairs per row. Label columns keep their natural
+    width; only the entry boxes stretch. Hint texts re-wrap to the panel
+    width. Start / Stop / Save now / Open data folder are two rows of two.
+  - The status bar is packed before the main area, so a short window no
+    longer hides it.
+  - Mouse wheel scrolls the left panel while the pointer is over it.
+  - Checked with default and enlarged fonts: no label, button or entry is
+    narrower than its text in any tab, before or after dragging the divider.
+
 ## 2026-11-19.2
 
 LAYOUT
